@@ -137,15 +137,16 @@ float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv
   lit/=9;
  }else lit=shadowMap.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
  float fade=1-smoothstep(config.w*.75,config.w,length(i.w.xy-eye.xy));float opacity=(1-lit)*config.y*fade*saturate(facing*4);
- float local=saturate(i.local);float lanternFill=0;
+ float local=saturate(i.local);float lanternProtection=0;
  if(lantern.w>0){float3 delta=i.w-lantern.xyz;float d2=dot(delta,delta);
   float falloff=saturate(1-d2/(lantern.w*lantern.w));
-  lanternFill=falloff*falloff*clamp(-4*dot(normalize(i.n),delta*rsqrt(max(d2,.0001))),.3,1)*(1-local);
+  lanternProtection=saturate(4*falloff*falloff*clamp(-4*dot(normalize(i.n),delta*rsqrt(max(d2,.0001))),.3,1));
  }
- // Native lights keep their contribution; fallback lantern warms only added shadows.
- float alpha=opacity*(1-local);
+ // Preserve the native lantern color. Synthetic fill tied to shadow visibility
+ // stamped a second colored silhouette into the illuminated ground.
+ float protection=max(local,lanternProtection);float alpha=opacity*(1-protection);
  float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
- return float4(float3(.8,.62,.34)*lanternFill*alpha+sunlight,alpha);}
+ return float4(sunlight,alpha);}
 )HLSL";
 static bool initialize(ID3D11DeviceContext* context){if(device)return ctx==context&&!failed;ctx=context;ctx->AddRef();ctx->GetDevice(&device);ID3D11Device1* d1=nullptr;
  bool ok=SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Device1),(void**)&d1))&&SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1),(void**)&ctx1));D3D_FEATURE_LEVEL levels[]={device->GetFeatureLevel()};if(ok)ok=SUCCEEDED(d1->CreateDeviceContextState(0,levels,1,D3D11_SDK_VERSION,__uuidof(ID3D11Device),nullptr,&state));drop(d1);

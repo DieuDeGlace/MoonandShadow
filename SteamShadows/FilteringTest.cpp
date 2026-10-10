@@ -52,9 +52,9 @@ int main(){
   std::array<int,3> result{pixel[0],pixel[1],pixel[2]};c->Unmap(staging,0);return result;
  };
  auto unlit=sampleLocal(false,false),local=sampleLocal(true,false),lantern=sampleLocal(false,true);
- assert(local[0]>unlit[0]+20);assert(lantern[0]>unlit[0]+20);assert(lantern[0]>lantern[2]+15);
+ assert(local[0]>unlit[0]+20);assert(lantern[0]>unlit[0]+20);for(int channel=0;channel<3;channel++)assert(lantern[channel]>=253);
  auto warmPixel=sampleLocal(false,false,true);assert(warmPixel[0]>135);assert(warmPixel[0]>warmPixel[2]+8);
- puts("Native point-light preservation and warm lantern fill in directional shadows: PASS");
+ puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
  shadows::drop(keptTarget);shadows::drop(keptDepth);
  ID3DDeviceContextState*saved=nullptr;shadows::ctx1->SwapDeviceContextState(shadows::state,&saved);ID3D11RenderTargetView*parked=nullptr;ID3D11DepthStencilView*parkedDepth=nullptr;c->OMGetRenderTargets(1,&parked,&parkedDepth);assert(!parked&&!parkedDepth);shadows::ctx1->SwapDeviceContextState(saved,nullptr);shadows::drop(saved);
  shadows::clearClouds();shadows::drop(vb);shadows::drop(color);shadows::drop(depth);shadows::drop(staging);shadows::drop(c);shadows::drop(d);
