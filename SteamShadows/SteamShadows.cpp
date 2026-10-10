@@ -136,6 +136,9 @@ float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
   lit/=9;
  }else lit=shadowMap.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
+ // A face turned away from the directional light has no direct contribution.
+ // Do not let its own depth samples produce alternating bright edge teeth.
+ lit*=smoothstep(0,.08,facing);
  float fade=1-smoothstep(config.w*sunTone.y,config.w,length(i.w.xy-eye.xy));float opacity=(1-lit)*config.y*fade;
  float local=saturate(i.local);float lanternProtection=0;
  if(lantern.w>0){float3 delta=i.w-lantern.xyz;float d2=dot(delta,delta);

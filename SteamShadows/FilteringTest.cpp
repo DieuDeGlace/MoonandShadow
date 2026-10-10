@@ -32,7 +32,7 @@ int main(){
  c->Unmap(staging,0);printf("Transition pixels: soft=%d crisp=%d\n",soft,crisp);assert(crisp<soft);
 
  // Exercise actual receiver pixels against the existing caster depth map.
- auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false,int face=4){
+ auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false,int face=4,bool outside=false){
   for(auto&v:vertices)v[3]=face/255.f;c->UpdateSubresource(vb,0,nullptr,vertices,0,0);
   float gray[]={.5f,.5f,.5f,1};c->ClearRenderTargetView(keptTarget,warm?gray:white);
   shadows::Params params{};assert(shadows::lightMatrix(params,ground));
@@ -49,13 +49,21 @@ int main(){
   ID3D11ShaderResourceView* nullView=nullptr;c->PSSetShaderResources(0,1,&nullView);c->OMSetRenderTargets(0,nullptr,nullptr);
   shadows::ctx1->SwapDeviceContextState(old,nullptr);shadows::drop(old);
   c->CopyResource(staging,color);assert(SUCCEEDED(c->Map(staging,0,D3D11_MAP_READ,0,&mapped)));
-  auto pixel=(unsigned char*)mapped.pData+256*mapped.RowPitch+(warm?168:256)*4;
+  auto pixel=(unsigned char*)mapped.pData+256*mapped.RowPitch+((warm||outside)?168:256)*4;
   std::array<int,3> result{pixel[0],pixel[1],pixel[2]};c->Unmap(staging,0);return result;
  };
  auto unlit=sampleLocal(false,false),local=sampleLocal(true,false),lantern=sampleLocal(false,true);
  assert(local[0]>unlit[0]+20);assert(lantern[0]>unlit[0]+20);for(int channel=0;channel<3;channel++)assert(lantern[channel]>=253);
  for(int face=0;face<6;face++){auto side=sampleLocal(false,false,false,face);assert(side[0]<200);}
  puts("All six block-face normals receive occluder shadows: PASS");
+ // Outside the occluder, sun-facing tops stay lit while away-facing sides
+ // retain the same directional shade as inside the occluder.
+ auto litTop=sampleLocal(false,false,false,4,true);
+ auto awayOutside=sampleLocal(false,false,false,5,true);
+ auto awayInside=sampleLocal(false,false,false,5,false);
+ assert(litTop[0]>240);assert(awayOutside[0]<200);
+ assert(abs(awayOutside[0]-awayInside[0])<=2);
+ puts("Away-facing shade stays consistent across caster boundaries: PASS");
  auto warmPixel=sampleLocal(false,false,true);assert(warmPixel[0]>135);assert(warmPixel[0]>warmPixel[2]+8);
  puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
  shadows::drop(keptTarget);shadows::drop(keptDepth);
