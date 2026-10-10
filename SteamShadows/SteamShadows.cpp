@@ -20,7 +20,7 @@ static const GUID cacheGuid={0x89d60734,0xeda9,0x4bf0,{0xb0,0x61,0xc9,0x11,0x33,
 static bool internal=false,enabled=true,finished=false,failed=false;
 static std::atomic<int> toggleRequest{0},captureRequest{0},disableRequest{0};
 static bool cloudShadows=true,softShadows=false;
-static UINT resolution=2048;static float radius=100,strength=.48f,bias=.00020f,sunWarmth=.03f;
+static UINT resolution=2048;static float radius=100,strength=.48f,bias=.00020f,sunWarmth=.03f,fadeStart=.4f;
 static ID3D11Device* device=nullptr;static ID3D11DeviceContext* ctx=nullptr;static ID3D11DeviceContext1* ctx1=nullptr;
 static ID3DDeviceContextState* state=nullptr;static ID3D11VertexShader *caster=nullptr,*receiver=nullptr;
 static ID3D11PixelShader* visibility=nullptr;static ID3D11Buffer* constants=nullptr;
@@ -112,7 +112,7 @@ memcpy(p.view,d.view,64);memcpy(p.proj,d.proj,64);
  }else if(moonEnabled){sun=norm({moon.direction[0],moon.direction[1],moon.direction[2]});activeStrength=moon.shadowStrength*moon.weight;}
  if(captureRequest.load()==2)sun=norm({.5f,.25f,.8f});Vec f{-sun.x,-sun.y,-sun.z};Vec r=norm(cross(f,fabsf(f.z)>.95f?Vec{0,1,0}:Vec{0,0,1})),u=cross(r,f);float snap=2*radius/resolution;
  float x=floorf(dot(r,eye)/snap+.5f)*snap,y=floorf(dot(u,eye)/snap+.5f)*snap;float span=cloudShadows?2048.f:512.f;float m[16]={r.x/radius,r.y/radius,r.z/radius,-x/radius,u.x/radius,u.y/radius,u.z/radius,-y/radius,f.x/span,f.y/span,f.z/span,.5f-dot(f,eye)/span,0,0,0,1};memcpy(p.light,m,64);
- p.eye[0]=eye.x;p.eye[1]=eye.y;p.eye[2]=eye.z;p.eye[3]=2.f/span;p.sun[0]=sun.x;p.sun[1]=sun.y;p.sun[2]=sun.z;p.sun[3]=softShadows?1.f:0.f;p.config[0]=1.f/resolution;p.config[1]=activeStrength*fmaxf(0.f,fminf(1.f,sun.z/.15f));p.config[2]=bias;p.config[3]=radius;if(g&&g->world){auto moonPhase=moonrules::state(g->world->state.time);p.sunTone[0]=sunWarmth*(1-moonPhase.weight)*std::clamp(-moonPhase.direction[2]*2.f,0.f,1.f);}return std::isfinite(eye.x)&&std::isfinite(eye.y)&&std::isfinite(eye.z);}
+ p.eye[0]=eye.x;p.eye[1]=eye.y;p.eye[2]=eye.z;p.eye[3]=2.f/span;p.sun[0]=sun.x;p.sun[1]=sun.y;p.sun[2]=sun.z;p.sun[3]=softShadows?1.f:0.f;p.config[0]=1.f/resolution;p.config[1]=activeStrength*fmaxf(0.f,fminf(1.f,sun.z/.15f));p.config[2]=bias;p.config[3]=radius;p.sunTone[1]=fadeStart;if(g&&g->world){auto moonPhase=moonrules::state(g->world->state.time);p.sunTone[0]=sunWarmth*(1-moonPhase.weight)*std::clamp(-moonPhase.direction[2]*2.f,0.f,1.f);}return std::isfinite(eye.x)&&std::isfinite(eye.y)&&std::isfinite(eye.z);}
 static const char* hlsl=R"HLSL(
 cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone;};
 struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
@@ -136,7 +136,7 @@ float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
   lit/=9;
  }else lit=shadowMap.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
- float fade=1-smoothstep(config.w*.75,config.w,length(i.w.xy-eye.xy));float opacity=(1-lit)*config.y*fade*saturate(facing*4);
+ float fade=1-smoothstep(config.w*sunTone.y,config.w,length(i.w.xy-eye.xy));float opacity=(1-lit)*config.y*fade*saturate(facing*4);
  float local=saturate(i.local);float lanternProtection=0;
  if(lantern.w>0){float3 delta=i.w-lantern.xyz;float d2=dot(delta,delta);
   float falloff=saturate(1-d2/(lantern.w*lantern.w));
@@ -246,7 +246,7 @@ static void STDMETHODCALLTYPE update(ID3D11DeviceContext* c,ID3D11Resource* r,UI
 static void STDMETHODCALLTYPE clear(ID3D11DeviceContext* c,ID3D11DepthStencilView* v,UINT flags,FLOAT z,UINT8 stencil){if(!internal&&(!ctx||ctx==c)&&(flags&D3D11_CLEAR_DEPTH)){render();clearDraws();finished=false;if(toggleRequest.exchange(0)||GetAsyncKeyState(VK_F7)&1){enabled=!enabled;log(enabled?"Shadows enabled.":"Shadows disabled.");}if(disableRequest.exchange(0))enabled=false;}oldClear(c,v,flags,z,stencil);}
 static bool patch(void** slot,void* fn){DWORD old;if(!VirtualProtect(slot,sizeof(void*),PAGE_READWRITE,&old))return false;InterlockedExchangePointer(slot,fn);DWORD unused;VirtualProtect(slot,sizeof(void*),old,&unused);return true;}
 static bool install(ID3D11DeviceContext* c){void** v=*(void***)c;if(table)return table==v;struct Hook{UINT slot;void* fn;void** original;};Hook hooks[]={{12,(void*)drawIndexed,(void**)&oldDI},{13,(void*)draw,(void**)&oldD},{14,(void*)map,(void**)&oldMap},{15,(void*)unmap,(void**)&oldUnmap},{48,(void*)update,(void**)&oldUpdate},{53,(void*)clear,(void**)&oldClear}};for(auto& h:hooks)*h.original=v[h.slot];int done=0;for(auto& h:hooks){if(!patch(v+h.slot,h.fn)){while(done--){auto& undo=hooks[done];patch(v+undo.slot,*undo.original);}return false;}done++;}table=v;log("D3D11 mesh capture hooks attached; F7 toggles shadows.");return true;}
-static DWORD attach(){sunWarmth=std::clamp((int)GetPrivateProfileIntW(L"Shadows",L"SunWarmthPercent",3,L".\\Mods\\SteamShadows.ini"),0,10)*.01f;softShadows=GetPrivateProfileIntW(L"Shadows",L"SoftShadows",0,L".\\Mods\\SteamShadows.ini")!=0;cloudShadows=GetPrivateProfileIntW(L"Shadows",L"CloudShadows",1,L".\\Mods\\SteamShadows.ini")!=0;resolution=GetPrivateProfileIntW(L"Shadows",L"Resolution",2048,L".\\Mods\\SteamShadows.ini");resolution=resolution<512?512:resolution>4096?4096:resolution;radius=(float)GetPrivateProfileIntW(L"Shadows",L"Radius",100,L".\\Mods\\SteamShadows.ini");radius=radius<8?8:radius>128?128:radius;strength=GetPrivateProfileIntW(L"Shadows",L"StrengthPercent",48,L".\\Mods\\SteamShadows.ini")*.01f;strength=strength<0?0:strength>1?1:strength;
+static DWORD attach(){fadeStart=std::clamp((int)GetPrivateProfileIntW(L"Shadows",L"FadeStartPercent",40,L".\\Mods\\SteamShadows.ini"),10,90)*.01f;sunWarmth=std::clamp((int)GetPrivateProfileIntW(L"Shadows",L"SunWarmthPercent",3,L".\\Mods\\SteamShadows.ini"),0,10)*.01f;softShadows=GetPrivateProfileIntW(L"Shadows",L"SoftShadows",0,L".\\Mods\\SteamShadows.ini")!=0;cloudShadows=GetPrivateProfileIntW(L"Shadows",L"CloudShadows",1,L".\\Mods\\SteamShadows.ini")!=0;resolution=GetPrivateProfileIntW(L"Shadows",L"Resolution",2048,L".\\Mods\\SteamShadows.ini");resolution=resolution<512?512:resolution>4096?4096:resolution;radius=(float)GetPrivateProfileIntW(L"Shadows",L"Radius",100,L".\\Mods\\SteamShadows.ini");radius=radius<8?8:radius>128?128:radius;strength=GetPrivateProfileIntW(L"Shadows",L"StrengthPercent",48,L".\\Mods\\SteamShadows.ini")*.01f;strength=strength<0?0:strength>1?1:strength;
  ID3D11Device* d=nullptr;ID3D11DeviceContext* c=nullptr;HRESULT hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d,nullptr,&c);bool ok=SUCCEEDED(hr)&&install(c);drop(c);drop(d);return ok?1:0;}
 }
 #ifndef MOON_AND_SHADOW

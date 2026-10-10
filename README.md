@@ -20,14 +20,10 @@ Close Steam Cube World, remove MoonLight.dll and SteamShadows.dll from Mods, and
 
 Supports the inspected Steam executable (PE timestamp 0x5d93ab0d, image size 0x5b7000); Alpha and Omega executables are unsupported. Moon and sun share one shadow map. GPU tests check rendering resources, filtering, cloud casting and moon rendering; they do not guarantee FPS or visual correctness in every location.
 
-## Native palette and sunlight
+## Appearance and fade
 
-World rendering is gently desaturated (86% saturation) with a 3% cool tint, based on supplied Alpha/Omega references. This is a stylistic approximation, not an exact recreation of their renderer. A native D3D11 pass runs once before the observed orthographic HUD draw; menus are skipped when no native world scene is observed. If a scene boundary cannot be identified, grading is skipped. ReShade files and effects are untouched; existing ReShade effects may still influence the final image.
+Palette/desaturation now lives in [alpha-lookalike](https://github.com/DieuDeGlace/alpha-lookalike), a separate loader DLL. MoonandShadow applies no fullscreen color grade. Install alpha-lookalike only if wanted. ReShade remains untouched. The optional FinishWorldLighting export allows the palette to finish moon/shadow rendering before grading regardless of hook installation order.
 
-`Mods/NativePalette.ini`: Enabled=1, SaturationPercent=86, CoolTintPercent=3. Set Enabled=0 to disable grading after restarting. The palette is included in MoonandShadow.dll; no additional DLL is required. The world color copy and fullscreen triangle add some GPU bandwidth/work, with no CPU GPU-readback stall. Resources follow the actual scene dimensions rather than assuming 1080p. Ordinary 2D targets and MSAA resolve are supported; other target layouts are skipped.
+SunWarmthPercent=3 retains the small warm sunlit contribution in the existing shadow receiver. FadeStartPercent=40 starts a smooth directional-shadow fade at 40% of Radius and reaches zero at Radius (40–100 blocks with Radius=100). This is a reference-inspired distance fade, not a change to shadow-map blur. The shadow map remains 3072 in the supplied preset; this fade adds no map or pass.
 
-`Mods/SteamShadows.ini`: SunWarmthPercent=3 adds a small warm brightness contribution only to sun-facing, unshadowed surfaces in the shadow receiver range, fading toward its edge and sunset. It reuses the existing shadow receiver pass and adds no caster pass or shadow map. Nighttime illumination is unchanged. Native local-light protection is retained. Lanterns suppress added directional shadows near their light; the original game supplies lantern brightness/color. No synthetic shadow-shaped lantern fill is added.
-
-Graphics tests check palette colors at 720p, 1080p and 360p, render-state restoration and released target bindings, and warm sunlight/shadow lighting. Live gameplay appearance, UI boundary detection and performance still require verification on the supported game.
-
-Lantern correction: the former synthetic warm fill was multiplied by directional shadow opacity, producing colored shadow silhouettes inside the lantern pool. It is removed; per-pixel lantern protection now smoothly suppresses directional shadow darkening near the player, fading over the existing 12-block radius. This approximation does not trace local-light occlusion or create lantern shadow maps.
+Lantern correction retains native illumination and suppresses added directional darkening near the player over the existing 12-block radius. No local-light shadow maps or occlusion tracing are added. Five moon/shadow tests pass; gameplay appearance and performance require live verification.
