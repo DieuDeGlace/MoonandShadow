@@ -2,12 +2,13 @@
 #define MOON_AND_SHADOW
 #include "MoonLight/MoonLight.cpp"
 #include "SteamShadows/SteamShadows.cpp"
+#include "Palette.h"
 class MoonandShadow:public GenericMod {
 public:
- void Initialize() override { moonlight::attach(); shadows::attach(); }
+ void Initialize() override { moonlight::attach(); shadows::attach(); palette::attach(); }
  void OnPresent(IDXGISwapChain*,UINT,UINT) override {
   moonlight::renderSky(); shadows::render(); shadows::commitClouds();
-  moonlight::clearSky(); moonlight::skyFinished=false;
+  palette::reset(); moonlight::clearSky(); moonlight::skyFinished=false;
   shadows::clearDraws(); shadows::frameOriginKnown=false; shadows::finished=false;
  }
 };
