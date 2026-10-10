@@ -32,7 +32,8 @@ int main(){
  c->Unmap(staging,0);printf("Transition pixels: soft=%d crisp=%d\n",soft,crisp);assert(crisp<soft);
 
  // Exercise actual receiver pixels against the existing caster depth map.
- auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false){
+ auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false,int face=4){
+  for(auto&v:vertices)v[3]=face/255.f;c->UpdateSubresource(vb,0,nullptr,vertices,0,0);
   float gray[]={.5f,.5f,.5f,1};c->ClearRenderTargetView(keptTarget,warm?gray:white);
   shadows::Params params{};assert(shadows::lightMatrix(params,ground));
   if(warm)params.sunTone[0]=.08f;
@@ -53,6 +54,8 @@ int main(){
  };
  auto unlit=sampleLocal(false,false),local=sampleLocal(true,false),lantern=sampleLocal(false,true);
  assert(local[0]>unlit[0]+20);assert(lantern[0]>unlit[0]+20);for(int channel=0;channel<3;channel++)assert(lantern[channel]>=253);
+ for(int face=0;face<6;face++){auto side=sampleLocal(false,false,false,face);assert(side[0]<200);}
+ puts("All six block-face normals receive occluder shadows: PASS");
  auto warmPixel=sampleLocal(false,false,true);assert(warmPixel[0]>135);assert(warmPixel[0]>warmPixel[2]+8);
  puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
  shadows::drop(keptTarget);shadows::drop(keptDepth);
