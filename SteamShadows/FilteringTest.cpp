@@ -97,6 +97,26 @@ int main() {
     ground.proj[10] = .01f;
     ground.proj[11] = .5f;
     ground.light[10] = 1;
+    // Repeated replay binds should issue no redundant uploads or IA changes.
+    auto emptyDraw = ground;
+    emptyDraw.count = 0;
+    shadows::Params cacheParams{};
+    shadows::replayBindings = {};
+    shadows::internal = true;
+    for (int repeat = 0; repeat < 100; ++repeat)
+        shadows::bind(emptyDraw, cacheParams);
+    assert(shadows::replayBindings.uploads == 1);
+    assert(shadows::replayBindings.stateChanges == 4);
+    cacheParams.depthAdjust[0] = .001f;
+    shadows::bind(emptyDraw, cacheParams);
+    assert(shadows::replayBindings.uploads == 2);
+    emptyDraw.offset = 4;
+    shadows::bind(emptyDraw, cacheParams);
+    assert(shadows::replayBindings.stateChanges == 5);
+    shadows::internal = false;
+    shadows::replayBindings = {};
+    puts(
+        "100 identical replay binds: 1 constant upload and 4 IA changes; changed inputs retained: PASS");
     shadows::draws.push_back(ground);
     shadows::sceneViewport = {0, 0, 512, 512, 0, 1};
     shadows::CloudCaster cloud{};
@@ -154,7 +174,7 @@ int main() {
 
     // Exercise actual receiver pixels against the existing caster depth map.
     auto sampleLocal = [&](bool nativeLight, bool lantern, bool warm = false, int face = 4,
-                           bool outside = false, bool entity = false) {
+                           bool outside = false, bool entity = false, bool cached = false) {
         for (auto &v : vertices)
             v[3] = face / 255.f;
         c->UpdateSubresource(vb, 0, nullptr, vertices, 0, 0);
@@ -188,7 +208,11 @@ int main() {
         c->PSSetConstantBuffers(0, 1, &shadows::constants);
         c->PSSetShaderResources(0, 1, &shadows::mapView);
         c->PSSetSamplers(0, 1, &shadows::sampler);
+        shadows::internal = cached;
+        shadows::replayBindings = {};
         shadows::bind(ground, params);
+        shadows::internal = false;
+        shadows::replayBindings = {};
         ID3D11ShaderResourceView *nullView = nullptr;
         c->PSSetShaderResources(0, 1, &nullView);
         c->OMSetRenderTargets(0, nullptr, nullptr);
@@ -202,6 +226,15 @@ int main() {
         c->Unmap(staging, 0);
         return result;
     };
+    for (int face = 0; face < 6; ++face) {
+        auto baseline = sampleLocal(false, false, false, face);
+        auto optimized = sampleLocal(false, false, false, face, false, false, true);
+        assert(baseline == optimized);
+    }
+    assert(sampleLocal(false, true, true, 4, false, true) ==
+           sampleLocal(false, true, true, 4, false, true, true));
+    puts(
+        "Cached replay matches baseline GPU pixels for all voxel normals, entity bias and lantern: PASS");
     auto unlit = sampleLocal(false, false), local = sampleLocal(true, false),
          lantern = sampleLocal(false, true);
     assert(local[0] > unlit[0] + 20);

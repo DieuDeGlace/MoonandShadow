@@ -635,16 +635,79 @@ static ID3D11Buffer *animatedTerrain(const Draw &x) {
         return nullptr;
     return animated; // GetPrivateData retains interface; caller releases it.
 }
+// This cache is valid only while we own the context state during shadow replay.
+// Native draws and diagnostic draws outside that pass always bind explicitly.
+struct ReplayBindings {
+    ID3D11DeviceContext *context = nullptr;
+    ID3D11Buffer *vertex = nullptr, *index = nullptr;
+    ID3D11InputLayout *layout = nullptr;
+    UINT stride = 0, vertexOffset = 0, indexOffset = 0;
+    DXGI_FORMAT format{};
+    D3D11_PRIMITIVE_TOPOLOGY topology{};
+    Params parameters{};
+    bool haveVertex = false, haveIndex = false, haveLayout = false;
+    bool haveTopology = false, haveParameters = false;
+    UINT uploads = 0, stateChanges = 0;
+};
+static ReplayBindings replayBindings;
+
 static void bind(const Draw &x, Params &p) {
     memcpy(p.world, x.world, 64);
-    oldUpdate(ctx, constants, 0, nullptr, &p, 0, 0);
+    auto &bindings = replayBindings;
+    if (internal && bindings.context != ctx) {
+        bindings = {};
+        bindings.context = ctx;
+    }
+    if (!internal || !bindings.haveParameters || memcmp(&bindings.parameters, &p, sizeof(p)) != 0) {
+        oldUpdate(ctx, constants, 0, nullptr, &p, 0, 0);
+        if (internal) {
+            bindings.parameters = p;
+            bindings.haveParameters = true;
+            ++bindings.uploads;
+        }
+    }
     auto animated = animatedTerrain(x);
     auto vb = animated ? animated : x.vb;
     UINT stride = animated ? 20 : x.stride, offset = animated ? 0 : x.offset;
-    ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
-    ctx->IASetIndexBuffer(x.ib, x.format, x.ibOffset);
-    ctx->IASetInputLayout(animated ? floatCasterLayout : x.layout);
-    ctx->IASetPrimitiveTopology(x.topology);
+    auto layout = animated ? floatCasterLayout : x.layout;
+    if (!internal || !bindings.haveVertex || bindings.vertex != vb || bindings.stride != stride ||
+        bindings.vertexOffset != offset) {
+        ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        if (internal) {
+            bindings.vertex = vb;
+            bindings.stride = stride;
+            bindings.vertexOffset = offset;
+            bindings.haveVertex = true;
+            ++bindings.stateChanges;
+        }
+    }
+    if (!internal || !bindings.haveIndex || bindings.index != x.ib || bindings.format != x.format ||
+        bindings.indexOffset != x.ibOffset) {
+        ctx->IASetIndexBuffer(x.ib, x.format, x.ibOffset);
+        if (internal) {
+            bindings.index = x.ib;
+            bindings.format = x.format;
+            bindings.indexOffset = x.ibOffset;
+            bindings.haveIndex = true;
+            ++bindings.stateChanges;
+        }
+    }
+    if (!internal || !bindings.haveLayout || bindings.layout != layout) {
+        ctx->IASetInputLayout(layout);
+        if (internal) {
+            bindings.layout = layout;
+            bindings.haveLayout = true;
+            ++bindings.stateChanges;
+        }
+    }
+    if (!internal || !bindings.haveTopology || bindings.topology != x.topology) {
+        ctx->IASetPrimitiveTopology(x.topology);
+        if (internal) {
+            bindings.topology = x.topology;
+            bindings.haveTopology = true;
+            ++bindings.stateChanges;
+        }
+    }
     if (x.indexed)
         oldDI(ctx, x.count, x.start, x.base);
     else
@@ -684,6 +747,7 @@ static void render() {
         capture("Mods\\SteamShadows-before.bmp");
     ID3DDeviceContextState *saved = nullptr;
     ctx1->SwapDeviceContextState(state, &saved);
+    replayBindings = {};
     D3D11_VIEWPORT originalViewport = sceneViewport;
     ctx->RSSetState(raster);
     ctx->VSSetConstantBuffers(0, 1, &constants);
@@ -778,6 +842,7 @@ static void render() {
     ctx->PSSetShaderResources(0, 1, &nullView);
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
     ctx1->SwapDeviceContextState(saved, nullptr);
+    replayBindings = {};
     drop(saved);
     if (shot)
         capture("Mods\\SteamShadows-after.bmp");
