@@ -131,7 +131,13 @@ V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(worl
 Texture2D<float> shadowMap:register(t0);SamplerComparisonState shadowSampler:register(s0);
 float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
  if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;float facing=dot(normalize(i.n),sun.xyz);
- float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.25);float bias=max(config.z,config.x*config.w*eye.w*min(slope,2)*.5);float lit=0;
+ // Receiver-plane depth change across the comparison sampler footprint.
+ float2 ux=ddx(uv),uy=ddy(uv);float zx=ddx(p.z),zy=ddy(p.z);
+ float det=ux.x*uy.y-ux.y*uy.x;
+ float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
+ float footprint=config.x*config.w*eye.w*min(slope,8);
+ if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=config.x*(abs(gradient.x)+abs(gradient.y));}
+ float bias=config.z+min(footprint,config.x*config.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
  [branch]if(sun.w>.5){
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
   lit/=9;
