@@ -5,6 +5,7 @@
 #include "../MoonLight/MoonRules.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include "../GpuPassTimer.h"
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -14,6 +15,7 @@
 
 // Loaded native terrain casts even outside the camera frustum; visible meshes receive.
 namespace shadows {
+static GpuPassTimer gpuTimer;
 template <class T> void drop(T *&p) {
     if (p) {
         p->Release();
@@ -746,6 +748,7 @@ static void render() {
     if (shot)
         capture("Mods\\SteamShadows-before.bmp");
     ID3DDeviceContextState *saved = nullptr;
+    gpuTimer.begin(device, ctx, "Mods\\SteamShadows.log", "Shadows (map/application)");
     ctx1->SwapDeviceContextState(state, &saved);
     replayBindings = {};
     D3D11_VIEWPORT originalViewport = sceneViewport;
@@ -819,6 +822,7 @@ static void render() {
             ++lastCloudCasters;
         }
     }
+    gpuTimer.split(ctx);
     ctx->RSSetState(receiverRaster);
     ctx->OMSetRenderTargets(1, &target, depth);
     ctx->OMSetDepthStencilState(testDepth, 0);
@@ -842,6 +846,7 @@ static void render() {
     ctx->PSSetShaderResources(0, 1, &nullView);
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
     ctx1->SwapDeviceContextState(saved, nullptr);
+    gpuTimer.end(ctx);
     replayBindings = {};
     drop(saved);
     if (shot)
