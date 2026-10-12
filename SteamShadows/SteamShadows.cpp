@@ -514,7 +514,12 @@ float4 nativeModel(NativeInput input):SV_TARGET{
   float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
   float facing=clamp(-4*dot(v.n,delta*rsqrt(max(d2,.0001))),.3,1);
   v.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
- }v.local=saturate(v.local);return visibility(v);
+ }v.local=saturate(v.local);
+ // Keep lookup just outside the model surface. The native raster position
+ // stays untouched; this avoids sampling the model's own adjacent voxel depth.
+ float normalOffset=min(2*config.x*config.w,.08);
+ v.w+=v.n*normalOffset;
+ return visibility(v);
 })NATIVE";
     for (int i = 0; i < 6 && ok; i++) {
         ID3DBlob *code = nullptr, *error = nullptr;
