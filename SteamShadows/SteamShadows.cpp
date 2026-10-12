@@ -498,8 +498,16 @@ bool modelMapCovered(float3 worldPosition, row_major float4x4 transform, float t
     return all(abs(p.xy) < 1 - 2 * texel) && p.z >= 0 && p.z <= 1;
 }
 float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Texture2D<float> map) {
+    // At noon the light grazes vertical voxel faces. Their shadow projection
+    // is thinner than a texel, so nearby faces can alternate across the filter
+    // footprint. Give those faces one consistent directional shade instead.
+    // Native ambient/back/local light is retained by the model blend below.
+    float facing = dot(normalize(i.n), sun.xyz);
+    float exposure = smoothstep(.15, .30, facing);
+    [branch] if (exposure <= 0)
+        return 0;
     if (!modelMapCovered(i.w, transform, region.x))
-        return 1;
+        return exposure;
     float3 p = mul(transform, float4(i.w, 1)).xyz;
     float2 uv = float2(p.x, -p.y) * .5 + .5;
     // Signed plane gradient in shadow UV coordinates. The orthographic rows
@@ -508,16 +516,15 @@ float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Tex
     denominator = (denominator < 0 ? -1 : 1) * max(abs(denominator), eye.w * .0005);
     float factor = region.w * region.w * eye.w * eye.w * .5 / denominator;
     float2 gradient = float2(-dot(i.n, transform[0].xyz), dot(i.n, transform[1].xyz)) * factor;
-    float facing = dot(normalize(i.n), sun.xyz);
     float baseBias = region.z * (1 + 2 * (1 - saturate(facing)));
     [branch] if (sun.w > .5) {
         float lit = 0;
         [unroll] for (int y = -1; y <= 1; y++)
             [unroll] for (int x = -1; x <= 1; x++)
                 lit += planeComparison(map, uv, p.z, gradient, region.x, baseBias, float2(x, y));
-        return lit / 9;
+        return exposure * lit / 9;
     }
-    return planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
+    return exposure * planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
 }
 #endif
 float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Texture2D<float> map){

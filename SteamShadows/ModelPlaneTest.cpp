@@ -154,53 +154,64 @@ int main(int argc, char **argv) {
         values.depthAdjust[1] = 1;
         context->UpdateSubresource(parameters, 0, nullptr, &values, 0, 0);
 
-        for (float sign : {-1.f, 1.f})
-            for (float gap : {0.f, closeGap}) {
-                auto depths = planeDepth(size, radius, sign * .75f, sign * .35f, gap);
-                texture.Width = texture.Height = size;
-                texture.Usage = D3D11_USAGE_DEFAULT;
-                texture.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                texture.CPUAccessFlags = 0;
-                ID3D11Texture2D *map = nullptr;
-                ID3D11ShaderResourceView *view = nullptr;
-                D3D11_SUBRESOURCE_DATA data{depths.data(), UINT(size * sizeof(float)), 0};
-                assert(SUCCEEDED(device->CreateTexture2D(&texture, &data, &map)));
-                assert(SUCCEEDED(device->CreateShaderResourceView(map, nullptr, &view)));
-                context->PSSetShaderResources(0, 1, &view);
+        // Above, within, and below the grazing transition, plus the accepted
+        // contact-shadow slope. Sweep subtexel phases at every orientation.
+        for (float steepness : {1.f, 3.5f, 5.f, 8.f, 10.f})
+            for (float sign : {-1.f, 1.f})
+                for (float gap : {0.f, closeGap}) {
+                    auto depths = planeDepth(size, radius, steepness * sign * .75f,
+                                             steepness * sign * .35f, gap);
+                    texture.Width = texture.Height = size;
+                    texture.Usage = D3D11_USAGE_DEFAULT;
+                    texture.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    texture.CPUAccessFlags = 0;
+                    ID3D11Texture2D *map = nullptr;
+                    ID3D11ShaderResourceView *view = nullptr;
+                    D3D11_SUBRESOURCE_DATA data{depths.data(), UINT(size * sizeof(float)), 0};
+                    assert(SUCCEEDED(device->CreateTexture2D(&texture, &data, &map)));
+                    assert(SUCCEEDED(device->CreateShaderResourceView(map, nullptr, &view)));
+                    context->PSSetShaderResources(0, 1, &view);
 
-                for (float phase : {0.f, .17f, .43f, .79f}) {
-                    FixtureParameters test{
-                        {radius, sign * .75f, sign * .35f, 0},
-                        {(float)outputSize, phase / size, (.91f - phase) / size, 0}};
-                    context->UpdateSubresource(fixtureParameters, 0, nullptr, &test, 0, 0);
-                    context->Draw(3, 0);
-                    context->CopyResource(staging, color);
-                    D3D11_MAPPED_SUBRESOURCE mapped{};
-                    assert(SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)));
-                    unsigned wrong = 0;
-                    float minimum = 1, maximum = 0;
-                    for (UINT y = 8; y < outputSize - 8; ++y) {
-                        const auto *row = (const float *)((const char *)mapped.pData +
-                                                          size_t(y) * mapped.RowPitch);
-                        for (UINT x = 8; x < outputSize - 8; ++x) {
-                            minimum = std::min(minimum, row[x]);
-                            maximum = std::max(maximum, row[x]);
-                            if (!std::isfinite(row[x]) ||
-                                (gap == 0 ? row[x] < .99f : row[x] > .01f))
-                                ++wrong;
+                    for (float phase : {0.f, .17f, .43f, .79f}) {
+                        FixtureParameters test{
+                            {radius, steepness * sign * .75f, steepness * sign * .35f, 0},
+                            {(float)outputSize, phase / size, (.91f - phase) / size, 0}};
+                        context->UpdateSubresource(fixtureParameters, 0, nullptr, &test, 0, 0);
+                        context->Draw(3, 0);
+                        context->CopyResource(staging, color);
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        assert(SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)));
+                        unsigned wrong = 0;
+                        float minimum = 1, maximum = 0;
+                        for (UINT y = 8; y < outputSize - 8; ++y) {
+                            const auto *row = (const float *)((const char *)mapped.pData +
+                                                              size_t(y) * mapped.RowPitch);
+                            for (UINT x = 8; x < outputSize - 8; ++x) {
+                                minimum = std::min(minimum, row[x]);
+                                maximum = std::max(maximum, row[x]);
+                                float facing =
+                                    1.f / std::sqrt(1.f + steepness * steepness *
+                                                              (.75f * .75f + .35f * .35f));
+                                float transition = std::clamp((facing - .15f) / .15f, 0.f, 1.f);
+                                float expected =
+                                    gap > 0 ? 0.f : transition * transition * (3 - 2 * transition);
+                                if (!std::isfinite(row[x]) || std::abs(row[x] - expected) > .01f)
+                                    ++wrong;
+                            }
                         }
+                        context->Unmap(staging, 0);
+                        printf(
+                            "%s slope=%.0f sign=%+.0f gap=%.2f phase=%.2f: wrong=%u range=[%.5f %.5f]\n",
+                            useNearMap ? "near" : "far", steepness, sign, gap, phase, wrong,
+                            minimum, maximum);
+                        ++cases;
+                        failures += wrong != 0;
                     }
-                    context->Unmap(staging, 0);
-                    printf("%s sign=%+.0f gap=%.2f phase=%.2f: wrong=%u range=[%.5f %.5f]\n",
-                           useNearMap ? "near" : "far", sign, gap, phase, wrong, minimum, maximum);
-                    ++cases;
-                    failures += wrong != 0;
+                    ID3D11ShaderResourceView *nullView = nullptr;
+                    context->PSSetShaderResources(0, 1, &nullView);
+                    view->Release();
+                    map->Release();
                 }
-                ID3D11ShaderResourceView *nullView = nullptr;
-                context->PSSetShaderResources(0, 1, &nullView);
-                view->Release();
-                map->Release();
-            }
     }
     context->ClearState();
     rasterState->Release();
