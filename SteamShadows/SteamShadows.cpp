@@ -6,6 +6,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include "../GpuPassTimer.h"
+#include "StableModelShaders.h"
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -42,7 +43,8 @@ static ID3D11DeviceContext *ctx = nullptr;
 static ID3D11DeviceContext1 *ctx1 = nullptr;
 static ID3DDeviceContextState *state = nullptr;
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
-static ID3D11PixelShader *visibility = nullptr;
+static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
+static ID3D11VertexShader *modelReceiver = nullptr;
 static ID3D11Buffer *constants = nullptr;
 static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nullptr;
 static bool cascadesEnabled = true;
@@ -490,12 +492,13 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, levels, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
-    const char *names[] = {"caster", "receiver", "visibility"};
-    for (int i = 0; i < 3 && ok; i++) {
+    const char *names[] = {"caster", "receiver", "visibility", "receiver", "visibility"};
+    for (int i = 0; i < 5 && ok; i++) {
         ID3DBlob *code = nullptr, *error = nullptr;
-        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", nullptr, nullptr, names[i],
-                                i < 2 ? "vs_4_0" : "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                                &code, &error);
+        const char *source = i >= 3 ? stableModelShaders : hlsl;
+        HRESULT hr = D3DCompile(source, strlen(source), "SteamShadows", nullptr, nullptr, names[i],
+                                (i < 2 || i == 3) ? "vs_4_0" : "ps_4_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
         if (error) {
             log((char *)error->GetBufferPointer());
             drop(error);
@@ -503,10 +506,14 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(hr);
         if (ok)
             ok = SUCCEEDED(
-                i < 2 ? device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                   nullptr, i ? &receiver : &caster)
-                      : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                  nullptr, &visibility));
+                (i < 2 || i == 3)
+                    ? device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                                 nullptr,
+                                                 i == 3 ? &modelReceiver
+                                                 : i    ? &receiver
+                                                        : &caster)
+                    : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                                nullptr, i == 4 ? &modelVisibility : &visibility));
         if (ok && i == 0) {
             D3D11_INPUT_ELEMENT_DESC element = {
                 "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
@@ -918,7 +925,14 @@ static void render() {
     ID3D11ShaderResourceView *shadowViews[] = {mapView, nearView};
     ctx->PSSetShaderResources(0, 2, shadowViews);
     ctx->PSSetSamplers(0, 1, &sampler);
+    bool modelShaderBound = false;
     for (auto &x : draws) {
+        bool useModelShader = !x.terrain;
+        if (useModelShader != modelShaderBound) {
+            ctx->VSSetShader(useModelShader ? modelReceiver : receiver, nullptr, 0);
+            ctx->PSSetShader(useModelShader ? modelVisibility : visibility, nullptr, 0);
+            modelShaderBound = useModelShader;
+        }
         memcpy(p.view, x.view, 64);
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));

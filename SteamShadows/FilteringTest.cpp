@@ -182,7 +182,7 @@ int main() {
     // Exercise actual receiver pixels against the existing caster depth map.
     auto sampleLocal = [&](bool nativeLight, bool lantern, bool warm = false, int face = 4,
                            bool outside = false, bool entity = false, bool cached = false,
-                           bool compact = false) {
+                           bool compact = false, bool stableModel = false) {
         for (auto &v : vertices)
             v[3] = face / 255.f;
         c->UpdateSubresource(vb, 0, nullptr, vertices, 0, 0);
@@ -194,6 +194,8 @@ int main() {
         if (warm)
             params.sunTone[0] = .08f;
         params.depthAdjust[1] = entity ? 1.f : 0.f;
+        if (entity)
+            params.cascade[3] = 0;
         if (nativeLight) {
             for (int slot : {1, 4, 8}) {
                 params.points[slot * 4 + 2] = 5;
@@ -218,8 +220,8 @@ int main() {
         c->RSSetViewports(1, &shadows::sceneViewport);
         c->OMSetDepthStencilState(shadows::testDepth, 0);
         c->OMSetBlendState(shadows::blend, nullptr, ~0u);
-        c->VSSetShader(shadows::receiver, nullptr, 0);
-        c->PSSetShader(shadows::visibility, nullptr, 0);
+        c->VSSetShader(stableModel ? shadows::modelReceiver : shadows::receiver, nullptr, 0);
+        c->PSSetShader(stableModel ? shadows::modelVisibility : shadows::visibility, nullptr, 0);
         c->VSSetConstantBuffers(0, 1, &shadows::constants);
         c->PSSetConstantBuffers(0, 1, &shadows::constants);
         ID3D11ShaderResourceView *maps[] = {shadows::mapView, shadows::nearView};
@@ -258,6 +260,11 @@ int main() {
                 assert(sampleLocal(localLight, lanternLight, true, face, false, true) ==
                        sampleLocal(localLight, lanternLight, true, face, false, true, true, true));
     puts("Compacted local lights match original GPU pixels for all voxel normals: PASS");
+    for (int face = 0; face < 6; ++face)
+        assert(sampleLocal(true, true, true, face, false, true, true, true) ==
+               sampleLocal(true, true, true, face, false, true, true, true, true));
+    puts(
+        "Accepted model shader pixels preserve local lights and occluder shading across all normals: PASS");
     auto unlit = sampleLocal(false, false), local = sampleLocal(true, false),
          lantern = sampleLocal(false, true);
     assert(local[0] > unlit[0] + 20);
