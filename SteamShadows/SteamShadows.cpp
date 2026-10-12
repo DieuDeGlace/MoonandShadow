@@ -1,3 +1,19 @@
+// SteamShadows: real-time directional sun/moon shadows for Cube World (Steam,
+// 64-bit, D3D11). Built on its own or as part of MoonandShadow (MOON_AND_SHADOW).
+//
+// Loaded native terrain casts even outside the camera frustum; visible meshes receive.
+//
+// Per frame:
+//   * Map/Unmap/UpdateSubresource hooks keep a CPU copy (private data) of every
+//     small constant buffer, so draw matrices can be read without GPU readback.
+//   * Draw/DrawIndexed hooks record() every opaque native world draw (and cache
+//     cloud draws separately).
+//   * When the world pass ends (HUD draw, depth clear or present), render():
+//       1. replays all loaded terrain chunks, recorded non-terrain draws and
+//          cached clouds into a light-space depth map ("caster" pass);
+//       2. replays the recorded draws over the scene with the "visibility"
+//          shader, darkening shadowed pixels and adding a little sun warmth.
+//   * F7 toggles shadows. MoonLight's moon direction is used at night.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "cwsdk.h"
@@ -13,7 +29,6 @@
 #include <cstring>
 #include <atomic>
 
-// Loaded native terrain casts even outside the camera frustum; visible meshes receive.
 namespace shadows {
 static GpuPassTimer gpuTimer;
 template <class T> void drop(T *&p) {
@@ -30,35 +45,60 @@ static void log(const char *s) {
         fclose(f);
     }
 }
+
+// ===========================================================================
+// Constants and state
+// ===========================================================================
+
+// ID3D11DeviceContext vtable slots.
+constexpr UINT SLOT_DRAW_INDEXED = 12, SLOT_DRAW = 13, SLOT_MAP = 14, SLOT_UNMAP = 15,
+               SLOT_UPDATE_SUBRESOURCE = 48, SLOT_CLEAR_DEPTH_STENCIL_VIEW = 53;
+// Vertex-shader constant buffer slots of a native world draw.
+constexpr UINT CB_PROJECTION = 0, CB_VIEW = 1, CB_WORLD = 2, CB_POINT_LIGHTS = 4, CB_LIGHT = 5,
+               CB_DEPTH_OFFSET = 8;
+// Offset of a chunk buffer's triangle count (not described by CWSDK).
+constexpr size_t CHUNK_BUFFER_TRIANGLES = 0x44;
+constexpr size_t MAX_RECORDED_DRAWS = 4096, MAX_CLOUDS = 96, MAX_TERRAIN_MESHES = 512;
+constexpr size_t TERRAIN_BYTES_LIMIT = 96 * 1024 * 1024;
+
+// Private-data key for the CPU copy of each constant buffer.
 static const GUID cacheGuid = {
     0x89d60734, 0xeda9, 0x4bf0, {0xb0, 0x61, 0xc9, 0x11, 0x33, 0x28, 0x21, 0x18}};
-static bool internal = false, enabled = true, finished = false, failed = false;
+static bool internal = false; // Our own draws are in progress.
+static bool enabled = true, finished = false, failed = false;
+// Requests from the exported control functions.
 static std::atomic<int> toggleRequest{0}, captureRequest{0}, disableRequest{0};
+// Settings (see SteamShadows.ini).
 static bool cloudShadows = true, softShadows = false;
 static UINT resolution = 4096;
 static float radius = 120, strength = .48f, bias = .008f, sunWarmth = .03f, fadeStart = .4f;
+// GPU objects.
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *ctx = nullptr;
 static ID3D11DeviceContext1 *ctx1 = nullptr;
-static ID3DDeviceContextState *state = nullptr;
+static ID3DDeviceContextState *state = nullptr; // Isolated pipeline state for our passes.
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
 static ID3D11PixelShader *visibility = nullptr;
 static ID3D11Buffer *constants = nullptr;
+// Caster input layouts for native (UBYTE4) and animated (float4) terrain vertices.
 static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nullptr;
-static ID3D11Texture2D *texture = nullptr;
+static ID3D11Texture2D *texture = nullptr; // The shadow map.
 static ID3D11DepthStencilView *mapDepth = nullptr;
 static ID3D11ShaderResourceView *mapView = nullptr;
 static ID3D11DepthStencilState *writeDepth = nullptr, *testDepth = nullptr;
 static ID3D11RasterizerState *raster = nullptr, *receiverRaster = nullptr;
 static ID3D11BlendState *blend = nullptr, *opaque = nullptr;
 static ID3D11SamplerState *sampler = nullptr;
+// The scene target/depth captured with the first recorded draw of the frame.
 static ID3D11RenderTargetView *target = nullptr;
 static ID3D11DepthStencilView *depth = nullptr;
 static D3D11_VIEWPORT sceneViewport{};
+// Statistics and diagnostics.
 static unsigned frames = 0, lastCount = 0;
 static double totalMs = 0;
 static bool captureLogged = false;
 static unsigned diagnosticRejects = 0;
+
 using DI = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, INT);
 using D = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT);
 using Map = HRESULT(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP,
@@ -74,12 +114,19 @@ static Map oldMap;
 static Unmap oldUnmap;
 static Update oldUpdate;
 static Clear oldClear;
-static void **table = nullptr;
+static void **table = nullptr; // Hooked context vtable (set once installed).
 struct Mapped {
     void *data;
     UINT bytes;
 };
-static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped;
+static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped; // Currently mapped.
+
+// ===========================================================================
+// Recorded draws and cached clouds
+// ===========================================================================
+
+// One recorded draw with everything needed to replay it. Holds references on
+// vb/ib/layout.
 struct Draw {
     ID3D11Buffer *vb = nullptr, *ib = nullptr;
     ID3D11InputLayout *layout = nullptr;
@@ -93,32 +140,38 @@ struct Draw {
     float pointLights[80]{};
     float depthOffset = 0;
 };
-static std::vector<Draw> draws;
+static std::vector<Draw> draws; // This frame's receivers.
+
+// A cloud cached in absolute world coordinates (clouds are often not drawn every
+// frame, but should keep casting shadows).
 struct CloudCaster {
     Draw draw{};
     double x = 0, y = 0;
     ULONGLONG seen = 0;
 };
-static std::vector<Draw> pendingClouds;
+static std::vector<Draw> pendingClouds; // Cloud draws seen this frame.
 static std::vector<CloudCaster> clouds;
 static cube::World *cloudWorld = nullptr;
+// World position of the render origin (Cube World renders relative to the player).
 static double frameOriginX = 0, frameOriginY = 0;
 static bool frameOriginKnown = false;
 static unsigned lastCloudCasters = 0;
-static void releaseCloudDraw(Draw &d) {
+
+static void releaseDraw(Draw &d) {
     drop(d.vb);
     drop(d.ib);
     drop(d.layout);
 }
 static void clearClouds() {
     for (auto &d : pendingClouds)
-        releaseCloudDraw(d);
+        releaseDraw(d);
     pendingClouds.clear();
     for (auto &c : clouds)
-        releaseCloudDraw(c.draw);
+        releaseDraw(c.draw);
     clouds.clear();
     frameOriginKnown = false;
 }
+// Current cloud drift applied by WorldMotion.dll (zero without it).
 static void cloudDrift(float out[2]) {
     out[0] = out[1] = 0;
     auto module = GetModuleHandleW(L"WorldMotion.dll");
@@ -127,11 +180,13 @@ static void cloudDrift(float out[2]) {
     if (query)
         query(out);
 }
+// End of frame: expires clouds unseen for 2 minutes and moves this frame's cloud
+// draws into the cache (replacing the same cloud at the same position).
 static void commitClouds() {
     ULONGLONG now = GetTickCount64();
     for (auto it = clouds.begin(); it != clouds.end();)
         if (now - it->seen > 120000) {
-            releaseCloudDraw(it->draw);
+            releaseDraw(it->draw);
             it = clouds.erase(it);
         } else
             ++it;
@@ -143,33 +198,37 @@ static void commitClouds() {
                        std::abs(c.draw.world[11] - d.world[11]) < .1;
             });
             if (found != clouds.end()) {
-                releaseCloudDraw(found->draw);
+                releaseDraw(found->draw);
                 found->draw = d;
                 found->x = x;
                 found->y = y;
                 found->seen = now;
                 d.vb = d.ib = nullptr;
                 d.layout = nullptr;
-            } else if (clouds.size() < 96) {
+            } else if (clouds.size() < MAX_CLOUDS) {
                 clouds.push_back({d, x, y, now});
                 d.vb = d.ib = nullptr;
                 d.layout = nullptr;
             }
         }
     for (auto &d : pendingClouds)
-        releaseCloudDraw(d);
+        releaseDraw(d);
     pendingClouds.clear();
 }
+
+// ===========================================================================
+// Loaded terrain (shadow casters beyond the camera view)
+// ===========================================================================
 
 struct TerrainMesh {
     ID3D11Buffer *vb;
     ID3D11Buffer *ib;
     nativeScene::Chunk info;
-    UINT count;
+    UINT count; // Index count.
     DXGI_FORMAT format;
 };
 static std::vector<TerrainMesh> terrainMeshes;
-static nativeScene::Chunks loadedChunks;
+static nativeScene::Chunks loadedChunks; // Native vertex buffer -> chunk.
 static cube::World *terrainWorld = nullptr;
 static ULONGLONG terrainRefresh = 0;
 static UINT lastTerrainCasters = 0;
@@ -181,6 +240,9 @@ static void clearTerrain() {
     terrainMeshes.clear();
     loadedChunks.clear();
 }
+
+// Every 500 ms: collects the chunk meshes of all loaded zones within
+// radius + 64 blocks of the player (bounded to 512 meshes / 96 MiB).
 static void refreshTerrain(cube::World *w) {
     if (w != terrainWorld) {
         clearTerrain();
@@ -222,7 +284,7 @@ static void refreshTerrain(cube::World *w) {
                 auto ib = (gfx::D3D11IndexBuffer *)cb->index_buffer;
                 if (!v->buffer || !ib->buffer)
                     continue;
-                UINT count = *(UINT *)((unsigned char *)cb + 0x44);
+                UINT count = *(UINT *)((unsigned char *)cb + CHUNK_BUFFER_TRIANGLES);
                 if (!count || count > 1000000)
                     continue;
                 count *= 3;
@@ -233,10 +295,11 @@ static void refreshTerrain(cube::World *w) {
                 v->buffer->GetDesc(&vd);
                 ib->buffer->GetDesc(&id);
                 if (count > id.ByteWidth / (format == DXGI_FORMAT_R16_UINT ? 2 : 4) ||
-                    vd.ByteWidth % 8 || bytes + vd.ByteWidth + id.ByteWidth > 96 * 1024 * 1024 ||
-                    next.size() >= 512)
+                    vd.ByteWidth % 8 || bytes + vd.ByteWidth + id.ByteWidth > TERRAIN_BYTES_LIMIT ||
+                    next.size() >= MAX_TERRAIN_MESHES)
                     continue;
-                nativeScene::Chunk info{zone->position, *(int *)((unsigned char *)cb + 0x5c)};
+                nativeScene::Chunk info{
+                    zone->position, *(int *)((unsigned char *)cb + nativeScene::CHUNK_BUFFER_Z)};
                 v->buffer->AddRef();
                 ib->buffer->AddRef();
                 next.push_back({v->buffer, ib->buffer, info, count, format});
@@ -248,20 +311,20 @@ static void refreshTerrain(cube::World *w) {
     terrainMeshes.swap(next);
     loadedChunks.swap(nextChunks);
 }
+
+// The shader constant buffer (layout matches cbuffer Params in the HLSL).
 struct Params {
     float world[16], view[16], proj[16], light[16], config[4], eye[4], sun[4], points[80],
         lantern[4], sunTone[4], depthAdjust[4];
 };
 static void clearDraws() {
-    for (auto &x : draws) {
-        drop(x.vb);
-        drop(x.ib);
-        drop(x.layout);
-    }
+    for (auto &x : draws)
+        releaseDraw(x);
     draws.clear();
     drop(target);
     drop(depth);
 }
+// Size of `r` if it is a constant buffer of at most 512 bytes, otherwise 0.
 static UINT bufferBytes(ID3D11Resource *r) {
     ID3D11Buffer *b = nullptr;
     if (FAILED(r->QueryInterface(__uuidof(ID3D11Buffer), (void **)&b)))
@@ -279,6 +342,11 @@ static bool readBuffer(ID3D11Buffer *b, void *out, UINT bytes) {
     UINT size = bytes;
     return SUCCEEDED(b->GetPrivateData(cacheGuid, &size, out)) && size == bytes;
 }
+
+// ===========================================================================
+// Light-space setup
+// ===========================================================================
+
 struct Vec {
     float x, y, z;
 };
@@ -292,9 +360,25 @@ static Vec norm(Vec a) {
     float n = sqrtf(dot(a, a));
     return n > 1e-6f ? Vec{a.x / n, a.y / n, a.z / n} : Vec{0, 0, 1};
 }
+
+// MoonLight's current state, if MoonandShadow/MoonLight is loaded and the moon is up.
+static bool queryMoon(MoonState &moon) {
+    auto moonModule = GetModuleHandleW(L"MoonandShadow.dll");
+    if (!moonModule)
+        moonModule = GetModuleHandleW(L"MoonLight.dll");
+    auto query = moonModule
+                     ? (BOOL(WINAPI *)(MoonState *))GetProcAddress(moonModule, "QueryMoonLight")
+                     : nullptr;
+    return query && query(&moon) && moon.version == 1;
+}
+
+// Fills the per-frame parts of `p` from the reference draw `d`: camera, the
+// player's lantern, the sun (or moon) direction and the orthographic light
+// matrix centred on the camera. Returns false if the camera cannot be recovered.
 static bool lightMatrix(Params &p, const Draw &d) {
     auto g = nativeScene::game();
     auto player = g && g->world ? g->world->local_creature : nullptr;
+    // The lantern protects the area around the player from shadow.
     if (frameOriginKnown && player && (player->entity_data.binary_toggles & 1)) {
         p.lantern[0] = (float)(player->entity_data.position.x / 65536. - frameOriginX);
         p.lantern[1] = (float)(player->entity_data.position.y / 65536. - frameOriginY);
@@ -303,6 +387,7 @@ static bool lightMatrix(Params &p, const Draw &d) {
     }
     memcpy(p.view, d.view, 64);
     memcpy(p.proj, d.proj, 64);
+    // Camera position = -R^-1 * t, from the view matrix rows (via cofactors).
     Vec a{d.view[0], d.view[1], d.view[2]}, b{d.view[4], d.view[5], d.view[6]},
         c{d.view[8], d.view[9], d.view[10]};
     float det = dot(a, cross(b, c));
@@ -315,14 +400,8 @@ static bool lightMatrix(Params &p, const Draw &d) {
     Vec sun = norm({d.light[8], d.light[9], d.light[10]});
     float activeStrength = strength;
     // MoonLight shares this map rather than installing a second caster pass.
-    auto moonModule = GetModuleHandleW(L"MoonandShadow.dll");
-    if (!moonModule)
-        moonModule = GetModuleHandleW(L"MoonLight.dll");
     MoonState moon{};
-    auto query = moonModule
-                     ? (BOOL(WINAPI *)(MoonState *))GetProcAddress(moonModule, "QueryMoonLight")
-                     : nullptr;
-    bool moonEnabled = query && query(&moon) && moon.version == 1;
+    bool moonEnabled = queryMoon(moon);
     if (g && g->world && g->world->local_creature) {
         auto cycle = moonrules::shadows(g->world->state.time, strength,
                                         moonEnabled ? moon.shadowStrength : 0.f);
@@ -332,29 +411,21 @@ static bool lightMatrix(Params &p, const Draw &d) {
         sun = norm({moon.direction[0], moon.direction[1], moon.direction[2]});
         activeStrength = moon.shadowStrength * moon.weight;
     }
-    if (captureRequest.load() == 2)
+    if (captureRequest.load() == 2) // PreviewSteamShadows: a fixed high sun.
         sun = norm({.5f, .25f, .8f});
+    // Light basis (right, up, forward), snapped to whole shadow-map texels.
     Vec f{-sun.x, -sun.y, -sun.z};
     Vec r = norm(cross(f, fabsf(f.z) > .95f ? Vec{0, 1, 0} : Vec{0, 0, 1})), u = cross(r, f);
     float snap = 2 * radius / resolution;
     float x = floorf(dot(r, eye) / snap + .5f) * snap, y = floorf(dot(u, eye) / snap + .5f) * snap;
-    float span = cloudShadows ? 2048.f : 512.f;
-    float m[16] = {r.x / radius,
-                   r.y / radius,
-                   r.z / radius,
-                   -x / radius,
-                   u.x / radius,
-                   u.y / radius,
-                   u.z / radius,
-                   -y / radius,
-                   f.x / span,
-                   f.y / span,
-                   f.z / span,
-                   .5f - dot(f, eye) / span,
-                   0,
-                   0,
-                   0,
-                   1};
+    float span = cloudShadows ? 2048.f : 512.f; // Depth range; clouds need more.
+    // clang-format off
+    float m[16] = {
+        r.x / radius, r.y / radius, r.z / radius, -x / radius,
+        u.x / radius, u.y / radius, u.z / radius, -y / radius,
+        f.x / span,   f.y / span,   f.z / span,   .5f - dot(f, eye) / span,
+        0,            0,            0,            1};
+    // clang-format on
     memcpy(p.light, m, 64);
     p.eye[0] = eye.x;
     p.eye[1] = eye.y;
@@ -365,17 +436,20 @@ static bool lightMatrix(Params &p, const Draw &d) {
     p.sun[2] = sun.z;
     p.sun[3] = softShadows ? 1.f : 0.f;
     p.config[0] = 1.f / resolution;
+    // Shadows fade in over the first 15% of the light's elevation.
     p.config[1] = activeStrength * fmaxf(0.f, fminf(1.f, sun.z / .15f));
     p.config[2] = bias / span;
     p.config[3] = radius;
     p.sunTone[1] = fadeStart;
     if (g && g->world) {
+        // Warm sunlight only by day, strongest when the sun is high.
         auto moonPhase = moonrules::state(g->world->state.time);
         p.sunTone[0] = sunWarmth * (1 - moonPhase.weight) *
                        std::clamp(-moonPhase.direction[2] * 2.f, 0.f, 1.f);
     }
     return std::isfinite(eye.x) && std::isfinite(eye.y) && std::isfinite(eye.z);
 }
+
 // Keep active lights in native order. Empty light slots otherwise cost a
 // branch on every receiver vertex, even when the scene has no local lights.
 static void compactPointLights(Params &params) {
@@ -394,60 +468,118 @@ static void compactPointLights(Params &params) {
     params.depthAdjust[2] = (float)count;
     params.depthAdjust[3] = 1;
 }
+
+// ===========================================================================
+// Shaders
+// ===========================================================================
+
+// caster:     light-space depth of terrain/models/clouds.
+// receiver:   reproduces the native vertex transform exactly (see combine) and
+//             accumulates point-light influence per vertex.
+// visibility: compares against the shadow map and outputs premultiplied sun
+//             warmth (rgb) and shadow opacity (alpha).
+// Params: config = (texel size, strength, bias, radius), eye.w = 2/depth span,
+// sun.w = soft shadows, sunTone = (warmth, fade start), depthAdjust = (native
+// depth offset, small-entity flag, light count, light count valid).
 static const char *hlsl = R"HLSL(
 cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;};
 struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
+
+// Alpha (w) of a native vertex holds the voxel face id (0..5).
 float3 normal(float a){int n=(int)round(a*255);return n==0?float3(1,0,0):n==1?float3(-1,0,0):n==2?float3(0,1,0):n==3?float3(0,-1,0):n==4?float3(0,0,1):float3(0,0,-1);}
-V caster(float4 p:POSITION){V o;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(light,w);o.w=w.xyz;o.n=0;o.local=0;return o;}
+
+V caster(float4 p:POSITION){
+    V o;
+    float4 w=mul(world,float4(p.xyz*255,1));
+    o.p=mul(light,w);
+    o.w=w.xyz;
+    o.n=0;
+    o.local=0;
+    return o;
+}
+
 // Keep the native y-multiply then x/z/w MAD order. Without precise, FXC
 // swaps the first two terms, producing angle-dependent coplanar triangles.
 float4 combine(row_major float4x4 m,float4 r){precise float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
-V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(world,v);row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2])-float4(0,0,0,depthAdjust.x),v),dot(combine(vw,proj[3]),v));o.w=w.xyz;o.n=normalize(mul((float3x3)world,normal(p.w)));o.local=0;
- // Match native point-light attenuation at vertices; no extra light shadow maps.
- int lightCount=depthAdjust.w>0?(int)depthAdjust.z:10;
- [loop]for(int j=0;j<lightCount;j++)if(pointPositions[j].w>0){
-  float3 delta=o.w-pointPositions[j].xyz;float d2=dot(delta,delta);
-  float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
-  float facing=clamp(-4*dot(o.n,delta*rsqrt(max(d2,.0001))),.3,1);
-  o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
- }o.local=saturate(o.local);return o;}
-Texture2D<float> shadowMap:register(t0);SamplerComparisonState shadowSampler:register(s0);
-float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
- float facing=dot(normalize(i.n),sun.xyz);
- // Receiver-plane depth change across the comparison sampler footprint.
- float2 ux=ddx(uv),uy=ddy(uv);float zx=ddx(p.z),zy=ddy(p.z);
- float det=ux.x*uy.y-ux.y*uy.x;
- float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
- float footprint=config.x*config.w*eye.w*min(slope,8);
- if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=config.x*(abs(gradient.x)+abs(gradient.y));}
- if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;
- // Small sprite faces need a stable normal-derived footprint. Screen
- // derivatives can mix adjacent faces across a pixel quad on these models.
- if(depthAdjust.y>0){
-  float3 n=normalize(i.n);float denom=max(abs(dot(n,light[2].xyz)),1e-7);
-  footprint=config.x*(abs(dot(n,light[0].xyz))+abs(dot(n,light[1].xyz)))/denom*config.w*config.w*eye.w*eye.w*.5;
- }
- float baseBias=depthAdjust.y>0?max(config.z,.1*eye.w*.5):config.z;
- float bias=baseBias+min(footprint,config.x*config.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
- [branch]if(sun.w>.5){
-  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
-  lit/=9;
- }else lit=shadowMap.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
- // A face turned away from the directional light has no direct contribution.
- // Do not let its own depth samples produce alternating bright edge teeth.
- lit*=smoothstep(0,.08,facing);
- float fade=1-smoothstep(config.w*sunTone.y,config.w,length(i.w.xy-eye.xy));float opacity=(1-lit)*config.y*fade;
- float local=saturate(i.local);float lanternProtection=0;
- if(lantern.w>0){float3 delta=i.w-lantern.xyz;float d2=dot(delta,delta);
-  float falloff=saturate(1-d2/(lantern.w*lantern.w));
-  lanternProtection=saturate(4*falloff*falloff*clamp(-4*dot(normalize(i.n),delta*rsqrt(max(d2,.0001))),.3,1));
- }
- // Preserve the native lantern color. Synthetic fill tied to shadow visibility
- // stamped a second colored silhouette into the illuminated ground.
- float protection=max(local,lanternProtection);float alpha=opacity*(1-protection);
- float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
- return float4(sunlight,alpha);}
+
+V receiver(float4 p:POSITION){
+    V o;
+    float4 v=float4(p.xyz*255,1);
+    float4 w=mul(world,v);
+    row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));
+    o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2])-float4(0,0,0,depthAdjust.x),v),dot(combine(vw,proj[3]),v));
+    o.w=w.xyz;
+    o.n=normalize(mul((float3x3)world,normal(p.w)));
+    o.local=0;
+    // Match native point-light attenuation at vertices; no extra light shadow maps.
+    int lightCount=depthAdjust.w>0?(int)depthAdjust.z:10;
+    [loop]for(int j=0;j<lightCount;j++)if(pointPositions[j].w>0){
+        float3 delta=o.w-pointPositions[j].xyz;
+        float d2=dot(delta,delta);
+        float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
+        float facing=clamp(-4*dot(o.n,delta*rsqrt(max(d2,.0001))),.3,1);
+        o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
+    }
+    o.local=saturate(o.local);
+    return o;
+}
+
+Texture2D<float> shadowMap:register(t0);
+SamplerComparisonState shadowSampler:register(s0);
+
+float4 visibility(V i):SV_TARGET{
+    float3 p=mul(light,float4(i.w,1)).xyz;
+    float2 uv=float2(p.x,-p.y)*.5+.5;
+    float facing=dot(normalize(i.n),sun.xyz);
+    // Receiver-plane depth change across the comparison sampler footprint.
+    float2 ux=ddx(uv),uy=ddy(uv);
+    float zx=ddx(p.z),zy=ddy(p.z);
+    float det=ux.x*uy.y-ux.y*uy.x;
+    float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
+    float footprint=config.x*config.w*eye.w*min(slope,8);
+    if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=config.x*(abs(gradient.x)+abs(gradient.y));}
+    if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;
+    // Small sprite faces need a stable normal-derived footprint. Screen
+    // derivatives can mix adjacent faces across a pixel quad on these models.
+    if(depthAdjust.y>0){
+        float3 n=normalize(i.n);
+        float denom=max(abs(dot(n,light[2].xyz)),1e-7);
+        footprint=config.x*(abs(dot(n,light[0].xyz))+abs(dot(n,light[1].xyz)))/denom*config.w*config.w*eye.w*eye.w*.5;
+    }
+    float baseBias=depthAdjust.y>0?max(config.z,.1*eye.w*.5):config.z;
+    float bias=baseBias+min(footprint,config.x*config.w*eye.w*16)*(sun.w>.5?2.1:1.1);
+    float lit=0;
+    [branch]if(sun.w>.5){
+        // Soft shadows: 3x3 comparison taps.
+        [unroll]for(int y=-1;y<=1;y++)
+            [unroll]for(int x=-1;x<=1;x++)
+                lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
+        lit/=9;
+    }else lit=shadowMap.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
+    // A face turned away from the directional light has no direct contribution.
+    // Do not let its own depth samples produce alternating bright edge teeth.
+    lit*=smoothstep(0,.08,facing);
+    float fade=1-smoothstep(config.w*sunTone.y,config.w,length(i.w.xy-eye.xy));
+    float opacity=(1-lit)*config.y*fade;
+    float local=saturate(i.local);
+    float lanternProtection=0;
+    if(lantern.w>0){
+        float3 delta=i.w-lantern.xyz;
+        float d2=dot(delta,delta);
+        float falloff=saturate(1-d2/(lantern.w*lantern.w));
+        lanternProtection=saturate(4*falloff*falloff*clamp(-4*dot(normalize(i.n),delta*rsqrt(max(d2,.0001))),.3,1));
+    }
+    // Preserve the native lantern color. Synthetic fill tied to shadow visibility
+    // stamped a second colored silhouette into the illuminated ground.
+    float protection=max(local,lanternProtection);
+    float alpha=opacity*(1-protection);
+    float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
+    return float4(sunlight,alpha);
+}
 )HLSL";
+
+// Creates every GPU resource on first use (for context `context`). Returns
+// false if creation failed or a different context is used later.
 static bool initialize(ID3D11DeviceContext *context) {
     if (device)
         return ctx == context && !failed;
@@ -462,12 +594,14 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, levels, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
+    // Shaders: two vertex shaders, then the pixel shader.
     const char *names[] = {"caster", "receiver", "visibility"};
     for (int i = 0; i < 3 && ok; i++) {
+        bool vertexShader = i < 2;
         ID3DBlob *code = nullptr, *error = nullptr;
         HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", nullptr, nullptr, names[i],
-                                i < 2 ? "vs_4_0" : "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                                &code, &error);
+                                vertexShader ? "vs_4_0" : "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                0, &code, &error);
         if (error) {
             log((char *)error->GetBufferPointer());
             drop(error);
@@ -475,11 +609,13 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(hr);
         if (ok)
             ok = SUCCEEDED(
-                i < 2 ? device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                   nullptr, i ? &receiver : &caster)
-                      : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                  nullptr, &visibility));
+                vertexShader
+                    ? device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                                 nullptr, i ? &receiver : &caster)
+                    : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                                nullptr, &visibility));
         if (ok && i == 0) {
+            // Caster layouts: native terrain (UBYTE4 as UNORM) and animated terrain (float4).
             D3D11_INPUT_ELEMENT_DESC element = {
                 "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
             ok = SUCCEEDED(device->CreateInputLayout(&element, 1, code->GetBufferPointer(),
@@ -498,6 +634,7 @@ static bool initialize(ID3D11DeviceContext *context) {
     cb.Usage = D3D11_USAGE_DEFAULT;
     if (ok)
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &constants));
+    // Shadow map: 32-bit depth, also readable as a float texture.
     D3D11_TEXTURE2D_DESC td{};
     td.Width = td.Height = resolution;
     td.MipLevels = td.ArraySize = 1;
@@ -541,6 +678,7 @@ static bool initialize(ID3D11DeviceContext *context) {
     bd.RenderTarget[0].RenderTargetWriteMask = 15;
     if (ok)
         ok = SUCCEEDED(device->CreateBlendState(&bd, &opaque));
+    // Receiver blend: colour = warmth + scene * (1 - opacity); destination alpha kept.
     auto &rt = bd.RenderTarget[0];
     rt.BlendEnable = TRUE;
     rt.SrcBlend = D3D11_BLEND_ONE;
@@ -552,6 +690,7 @@ static bool initialize(ID3D11DeviceContext *context) {
     rt.RenderTargetWriteMask = 7;
     if (ok)
         ok = SUCCEEDED(device->CreateBlendState(&bd, &blend));
+    // Hardware 2x2 PCF; outside the map counts as lit.
     D3D11_SAMPLER_DESC ss{};
     ss.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
     ss.AddressU = ss.AddressV = ss.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
@@ -569,6 +708,8 @@ static bool initialize(ID3D11DeviceContext *context) {
     log(ok ? status : "Resource initialization failed; original rendering preserved.");
     return ok;
 }
+
+// Saves the scene target as a 32-bit BMP (diagnostics for CaptureSteamShadows).
 static void capture(const char *path) {
     if (!target)
         return;
@@ -611,7 +752,7 @@ static void capture(const char *path) {
             if (f) {
                 BITMAPFILEHEADER fh{};
                 BITMAPINFOHEADER ih{};
-                fh.bfType = 0x4d42;
+                fh.bfType = 0x4d42; // "BM"
                 fh.bfOffBits = sizeof(fh) + sizeof(ih);
                 fh.bfSize = fh.bfOffBits + d.Width * d.Height * 4;
                 ih.biSize = sizeof(ih);
@@ -625,7 +766,7 @@ static void capture(const char *path) {
                 std::vector<unsigned char> row(d.Width * 4);
                 for (UINT y = 0; y < d.Height; y++) {
                     memcpy(row.data(), (char *)m.pData + y * m.RowPitch, row.size());
-                    if (d.Format == DXGI_FORMAT_R8G8B8A8_UNORM)
+                    if (d.Format == DXGI_FORMAT_R8G8B8A8_UNORM) // BMP wants BGRA.
                         for (UINT x = 0; x < d.Width; x++)
                             std::swap(row[x * 4], row[x * 4 + 2]);
                     fwrite(row.data(), 1, row.size(), f);
@@ -639,6 +780,11 @@ static void capture(const char *path) {
     drop(resolved);
     drop(t);
 }
+
+// ===========================================================================
+// Replay
+// ===========================================================================
+
 // Motion can execute inside our draw hook, after capture. Resolve its mesh
 // at replay time for receivers as well as casters, independent of load order.
 static ID3D11Buffer *animatedTerrain(const Draw &x) {
@@ -672,6 +818,8 @@ struct ReplayBindings {
 };
 static ReplayBindings replayBindings;
 
+// Uploads `p` (with x's world matrix), binds x's geometry and draws it. During
+// our own passes (internal), unchanged state is not re-sent.
 static void bind(const Draw &x, Params &p) {
     memcpy(p.world, x.world, 64);
     auto &bindings = replayBindings;
@@ -687,6 +835,7 @@ static void bind(const Draw &x, Params &p) {
             ++bindings.uploads;
         }
     }
+    // Animated terrain (WorldMotion) uses 20-byte float vertices.
     auto animated = animatedTerrain(x);
     auto vb = animated ? animated : x.vb;
     UINT stride = animated ? 20 : x.stride, offset = animated ? 0 : x.offset;
@@ -735,6 +884,90 @@ static void bind(const Draw &x, Params &p) {
         oldD(ctx, x.count, x.start);
     drop(animated);
 }
+
+// Caster pass, terrain: every loaded chunk (positioned relative to the render
+// origin derived from `reference`), then the recorded non-terrain draws.
+static void renderTerrainCasters(const Draw &reference, Params &p) {
+    double ox = double(reference.terrainInfo.zone.x) * 64 - reference.world[3],
+           oy = double(reference.terrainInfo.zone.y) * 64 - reference.world[7];
+    for (auto &m : terrainMeshes) {
+        Draw x{};
+        x.vb = m.vb;
+        x.ib = m.ib;
+        x.count = m.count;
+        x.format = m.format;
+        x.stride = 8;
+        x.layout = nativeCasterLayout;
+        x.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        x.world[0] = x.world[5] = x.world[10] = x.world[15] = 1;
+        x.world[3] = (float)(double(m.info.zone.x) * 64 - ox);
+        x.world[7] = (float)(double(m.info.zone.y) * 64 - oy);
+        x.world[11] = (float)m.info.z;
+        ID3D11Buffer *animated = nullptr;
+        UINT bytes = sizeof(animated);
+        if (SUCCEEDED(m.vb->GetPrivateData(nativeScene::animatedGuid, &bytes, &animated)) &&
+            animated) {
+            x.vb = animated;
+            x.stride = 20;
+            x.layout = floatCasterLayout;
+        }
+        bind(x, p);
+        drop(animated);
+        lastTerrainCasters++;
+    }
+    for (auto &x : draws)
+        if (!x.terrain)
+            bind(x, p);
+}
+
+// Caster pass, clouds: cached clouds at their current (drifted) position,
+// skipped when entirely outside the shadow map. Clouds cast only: never replay
+// them as darkened scene receivers.
+static void renderCloudCasters(Params &p) {
+    float drift[2]{};
+    cloudDrift(drift);
+    for (auto &cached : clouds) {
+        Draw x = cached.draw;
+        x.world[3] = (float)(cached.x - frameOriginX) + drift[0];
+        x.world[7] = (float)(cached.y - frameOriginY) + drift[1];
+        float extent = 24 * (std::max)(std::abs(x.world[0]),
+                                       (std::max)(std::abs(x.world[5]), std::abs(x.world[10])));
+        float lx = p.light[0] * x.world[3] + p.light[1] * x.world[7] + p.light[2] * x.world[11] +
+                   p.light[3],
+              ly = p.light[4] * x.world[3] + p.light[5] * x.world[7] + p.light[6] * x.world[11] +
+                   p.light[7];
+        if (std::abs(lx) > 1 + extent / radius || std::abs(ly) > 1 + extent / radius)
+            continue;
+        bind(x, p);
+        ++lastCloudCasters;
+    }
+}
+
+// Receiver pass: every recorded draw again, with the visibility shader.
+static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
+    ctx->RSSetState(receiverRaster);
+    ctx->OMSetRenderTargets(1, &target, depth);
+    ctx->OMSetDepthStencilState(testDepth, 0);
+    ctx->OMSetBlendState(blend, nullptr, ~0u);
+    ctx->RSSetViewports(1, &viewport);
+    ctx->VSSetShader(receiver, nullptr, 0);
+    ctx->PSSetShader(visibility, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &mapView);
+    ctx->PSSetSamplers(0, 1, &sampler);
+    for (auto &x : draws) {
+        memcpy(p.view, x.view, 64);
+        memcpy(p.proj, x.proj, 64);
+        memcpy(p.points, x.pointLights, sizeof(p.points));
+        compactPointLights(p);
+        p.depthAdjust[0] = x.depthOffset;
+        float modelScale =
+            sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
+        p.depthAdjust[1] = !x.terrain && modelScale < .5f ? 1.f : 0.f;
+        bind(x, p);
+    }
+}
+
+// Renders shadows for this frame's recorded draws (once per frame) and clears them.
 static void render() {
     if (draws.empty())
         return;
@@ -755,7 +988,7 @@ static void render() {
         clearDraws();
         return;
     }
-    if (p.config[1] <= 0 && captureRequest.load() == 0) {
+    if (p.config[1] <= 0 && captureRequest.load() == 0) { // No visible shadow (night/horizon).
         clearDraws();
         return;
     }
@@ -771,6 +1004,8 @@ static void render() {
     ctx1->SwapDeviceContextState(state, &saved);
     replayBindings = {};
     D3D11_VIEWPORT originalViewport = sceneViewport;
+
+    // 1. Caster pass into the shadow map.
     ctx->RSSetState(raster);
     ctx->VSSetConstantBuffers(0, 1, &constants);
     ctx->PSSetConstantBuffers(0, 1, &constants);
@@ -786,82 +1021,18 @@ static void render() {
     auto reference =
         std::find_if(draws.begin(), draws.end(), [](const Draw &d) { return d.terrain; });
     lastTerrainCasters = 0;
-    if (reference != draws.end() && !terrainMeshes.empty()) {
-        double ox = double(reference->terrainInfo.zone.x) * 64 - reference->world[3],
-               oy = double(reference->terrainInfo.zone.y) * 64 - reference->world[7];
-        for (auto &m : terrainMeshes) {
-            Draw x{};
-            x.vb = m.vb;
-            x.ib = m.ib;
-            x.count = m.count;
-            x.format = m.format;
-            x.stride = 8;
-            x.layout = nativeCasterLayout;
-            x.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-            x.world[0] = x.world[5] = x.world[10] = x.world[15] = 1;
-            x.world[3] = (float)(double(m.info.zone.x) * 64 - ox);
-            x.world[7] = (float)(double(m.info.zone.y) * 64 - oy);
-            x.world[11] = (float)m.info.z;
-            ID3D11Buffer *animated = nullptr;
-            UINT bytes = sizeof(animated);
-            if (SUCCEEDED(m.vb->GetPrivateData(nativeScene::animatedGuid, &bytes, &animated)) &&
-                animated) {
-                x.vb = animated;
-                x.stride = 20;
-                x.layout = floatCasterLayout;
-            }
-            bind(x, p);
-            drop(animated);
-            lastTerrainCasters++;
-        }
-        for (auto &x : draws)
-            if (!x.terrain)
-                bind(x, p);
-    } else
+    if (reference != draws.end() && !terrainMeshes.empty())
+        renderTerrainCasters(*reference, p);
+    else
         for (auto &x : draws)
             bind(x, p);
-    // Clouds cast only: never replay them as darkened scene receivers.
     lastCloudCasters = 0;
-    if (cloudShadows && frameOriginKnown) {
-        float drift[2]{};
-        cloudDrift(drift);
-        for (auto &cached : clouds) {
-            Draw x = cached.draw;
-            x.world[3] = (float)(cached.x - frameOriginX) + drift[0];
-            x.world[7] = (float)(cached.y - frameOriginY) + drift[1];
-            float extent = 24 * (std::max)(std::abs(x.world[0]),
-                                           (std::max)(std::abs(x.world[5]), std::abs(x.world[10])));
-            float lx = p.light[0] * x.world[3] + p.light[1] * x.world[7] +
-                       p.light[2] * x.world[11] + p.light[3],
-                  ly = p.light[4] * x.world[3] + p.light[5] * x.world[7] +
-                       p.light[6] * x.world[11] + p.light[7];
-            if (std::abs(lx) > 1 + extent / radius || std::abs(ly) > 1 + extent / radius)
-                continue;
-            bind(x, p);
-            ++lastCloudCasters;
-        }
-    }
+    if (cloudShadows && frameOriginKnown)
+        renderCloudCasters(p);
     gpuTimer.split(ctx);
-    ctx->RSSetState(receiverRaster);
-    ctx->OMSetRenderTargets(1, &target, depth);
-    ctx->OMSetDepthStencilState(testDepth, 0);
-    ctx->OMSetBlendState(blend, nullptr, ~0u);
-    ctx->RSSetViewports(1, &originalViewport);
-    ctx->VSSetShader(receiver, nullptr, 0);
-    ctx->PSSetShader(visibility, nullptr, 0);
-    ctx->PSSetShaderResources(0, 1, &mapView);
-    ctx->PSSetSamplers(0, 1, &sampler);
-    for (auto &x : draws) {
-        memcpy(p.view, x.view, 64);
-        memcpy(p.proj, x.proj, 64);
-        memcpy(p.points, x.pointLights, sizeof(p.points));
-        compactPointLights(p);
-        p.depthAdjust[0] = x.depthOffset;
-        float modelScale =
-            sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
-        p.depthAdjust[1] = !x.terrain && modelScale < .5f ? 1.f : 0.f;
-        bind(x, p);
-    }
+
+    // 2. Receiver pass over the scene.
+    renderReceivers(p, originalViewport);
     ID3D11ShaderResourceView *nullView = nullptr;
     ctx->PSSetShaderResources(0, 1, &nullView);
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
@@ -887,6 +1058,66 @@ static void render() {
     }
     clearDraws();
 }
+
+// ===========================================================================
+// Recording
+// ===========================================================================
+
+// If the current draw uses a cloud sprite's buffer, records it for the cloud
+// cache and returns true (clouds are never receivers).
+static bool recordCloud(ID3D11DeviceContext *c, cube::World *world, UINT count, UINT start,
+                        INT base, bool indexed) {
+    Draw cloud{};
+    c->IAGetVertexBuffers(0, 1, &cloud.vb, &cloud.stride, &cloud.offset);
+    if (!nativeScene::cloud(world, cloud.vb)) {
+        drop(cloud.vb);
+        return false;
+    }
+    ID3D11Buffer *matrices[3]{};
+    c->VSGetConstantBuffers(0, 3, matrices);
+    bool valid = readBuffer(matrices[CB_PROJECTION], cloud.proj, 64) &&
+                 readBuffer(matrices[CB_WORLD], cloud.world, 64) && std::abs(cloud.proj[15]) < .5f;
+    // WorldMotion tags drifted clouds; store the undrifted position.
+    float capturedDrift[2]{};
+    UINT driftBytes = sizeof(capturedDrift);
+    if (matrices[CB_WORLD])
+        matrices[CB_WORLD]->GetPrivateData(nativeScene::cloudDriftGuid, &driftBytes, capturedDrift);
+    for (auto &b : matrices)
+        drop(b);
+    c->IAGetIndexBuffer(&cloud.ib, &cloud.format, &cloud.ibOffset);
+    c->IAGetInputLayout(&cloud.layout);
+    c->IAGetPrimitiveTopology(&cloud.topology);
+    cloud.count = count;
+    cloud.start = start;
+    cloud.base = base;
+    cloud.indexed = indexed;
+    cloud.world[3] -= capturedDrift[0];
+    cloud.world[7] -= capturedDrift[1];
+    if (valid && cloud.vb && cloud.layout && (cloud.stride == 8 || cloud.stride == 20) &&
+        (!indexed || cloud.ib) && cloud.topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+        pendingClouds.push_back(cloud);
+    else
+        releaseDraw(cloud);
+    return true;
+}
+
+// Native world draws bind six vertex constant buffers of these sizes.
+static bool nativeWorldBuffers(ID3D11Buffer *const buffers[6]) {
+    UINT expected[] = {64, 64, 64, 16, 320, 48};
+    bool world = true;
+    for (int i = 0; i < 6; i++) {
+        D3D11_BUFFER_DESC d{};
+        if (buffers[i])
+            buffers[i]->GetDesc(&d);
+        if (d.ByteWidth != expected[i])
+            world = false;
+    }
+    return world;
+}
+
+// Called before every native draw. Records opaque world draws as shadow
+// receivers, caches clouds, and triggers render() when the world pass ends.
+// Returns true when the draw was recorded.
 static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, bool indexed) {
     if (internal || failed || c->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
         return false;
@@ -898,51 +1129,12 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         clearClouds();
         cloudWorld = nativeCloudWorld;
     }
-    if (cloudShadows && enabled && nativeCloudWorld && pendingClouds.size() < 96) {
-        Draw cloud{};
-        c->IAGetVertexBuffers(0, 1, &cloud.vb, &cloud.stride, &cloud.offset);
-        if (nativeScene::cloud(nativeCloudWorld, cloud.vb)) {
-            ID3D11Buffer *matrices[3]{};
-            c->VSGetConstantBuffers(0, 3, matrices);
-            bool valid = readBuffer(matrices[0], cloud.proj, 64) &&
-                         readBuffer(matrices[2], cloud.world, 64) && std::abs(cloud.proj[15]) < .5f;
-            float capturedDrift[2]{};
-            UINT driftBytes = sizeof(capturedDrift);
-            if (matrices[2])
-                matrices[2]->GetPrivateData(nativeScene::cloudDriftGuid, &driftBytes,
-                                            capturedDrift);
-            for (auto &b : matrices)
-                drop(b);
-            c->IAGetIndexBuffer(&cloud.ib, &cloud.format, &cloud.ibOffset);
-            c->IAGetInputLayout(&cloud.layout);
-            c->IAGetPrimitiveTopology(&cloud.topology);
-            cloud.count = count;
-            cloud.start = start;
-            cloud.base = base;
-            cloud.indexed = indexed;
-            cloud.world[3] -= capturedDrift[0];
-            cloud.world[7] -= capturedDrift[1];
-            if (valid && cloud.vb && cloud.layout && (cloud.stride == 8 || cloud.stride == 20) &&
-                (!indexed || cloud.ib) && cloud.topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-                pendingClouds.push_back(cloud);
-            else
-                releaseCloudDraw(cloud);
-            return false;
-        }
-        drop(cloud.vb);
-    }
+    if (cloudShadows && enabled && nativeCloudWorld && pendingClouds.size() < MAX_CLOUDS &&
+        recordCloud(c, nativeCloudWorld, count, start, base, indexed))
+        return false;
     ID3D11Buffer *buffers[6]{};
     c->VSGetConstantBuffers(0, 6, buffers);
-    UINT expected[] = {64, 64, 64, 16, 320, 48};
-    bool world = true;
-    for (int i = 0; i < 6; i++) {
-        D3D11_BUFFER_DESC d{};
-        if (buffers[i])
-            buffers[i]->GetDesc(&d);
-        if (d.ByteWidth != expected[i])
-            world = false;
-    }
-    if (!world) {
+    if (!nativeWorldBuffers(buffers)) {
         for (auto &b : buffers)
             drop(b);
         // Sky and auxiliary draws can use another shader while retaining the main
@@ -957,15 +1149,17 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         }
         return false;
     }
-    if (!initialize(c) || finished || !enabled || draws.size() >= 4096) {
+    if (!initialize(c) || finished || !enabled || draws.size() >= MAX_RECORDED_DRAWS) {
         for (auto &b : buffers)
             drop(b);
         return false;
     }
     Draw x{};
-    bool ok = readBuffer(buffers[0], x.proj, 64) && readBuffer(buffers[1], x.view, 64) &&
-              readBuffer(buffers[2], x.world, 64) && readBuffer(buffers[5], x.light, 48);
-    readBuffer(buffers[4], x.pointLights, 320);
+    bool ok = readBuffer(buffers[CB_PROJECTION], x.proj, 64) &&
+              readBuffer(buffers[CB_VIEW], x.view, 64) &&
+              readBuffer(buffers[CB_WORLD], x.world, 64) &&
+              readBuffer(buffers[CB_LIGHT], x.light, 48);
+    readBuffer(buffers[CB_POINT_LIGHTS], x.pointLights, 320);
     for (auto &b : buffers)
         drop(b);
     if (!ok)
@@ -996,6 +1190,7 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
             x.proj[15], x.world[0], x.world[5], x.world[10], x.world[3], x.world[7], x.world[11]);
         log(s);
     }
+    // Blended (transparent) draws are not shadow receivers.
     ID3D11BlendState *bs = nullptr;
     float factor[4];
     UINT mask;
@@ -1016,28 +1211,24 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     c->IAGetPrimitiveTopology(&x.topology);
     if (!x.vb || !x.layout || (indexed && !x.ib) ||
         x.topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
-        drop(x.vb);
-        drop(x.ib);
-        drop(x.layout);
+        releaseDraw(x);
         return false;
     }
     auto game = nativeScene::game();
     auto nativeWorld = game ? game->world : nullptr;
     refreshTerrain(nativeWorld);
     if (nativeScene::cloud(nativeWorld, x.vb)) {
-        drop(x.vb);
-        drop(x.ib);
-        drop(x.layout);
+        releaseDraw(x);
         return false;
     }
     // Alternate cameras and clouds are excluded before comparing scene views.
     // Pitch-dependent draw ordering must not finish an incomplete shadow pass.
     if (!draws.empty() && memcmp(x.view, draws.front().view, 64) != 0) {
-        drop(x.vb);
-        drop(x.ib);
-        drop(x.layout);
+        releaseDraw(x);
         return false;
     }
+    // Native terrain chunks (possibly replaced by WorldMotion's copy) also tell
+    // us where the render origin is in the world.
     ID3D11Buffer *source = x.vb;
     nativeScene::ChunkTag tag{};
     UINT tagBytes = sizeof(tag);
@@ -1054,7 +1245,7 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         frameOriginKnown = true;
     }
     ID3D11Buffer *offsetBuffer = nullptr;
-    c->VSGetConstantBuffers(8, 1, &offsetBuffer);
+    c->VSGetConstantBuffers(CB_DEPTH_OFFSET, 1, &offsetBuffer);
     float offsetValues[4]{};
     if (offsetBuffer && readBuffer(offsetBuffer, offsetValues, 16))
         x.depthOffset = offsetValues[0];
@@ -1069,9 +1260,7 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
                       vp.TopLeftX, vp.TopLeftY);
             log(s);
         }
-        drop(x.vb);
-        drop(x.ib);
-        drop(x.layout);
+        releaseDraw(x);
         return false;
     }
     if (draws.empty()) {
@@ -1085,6 +1274,11 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     draws.push_back(x);
     return true;
 }
+
+// ===========================================================================
+// Hooks
+// ===========================================================================
+
 static void STDMETHODCALLTYPE drawIndexed(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     record(c, n, s, b, true);
     oldDI(c, n, s, b);
@@ -1093,6 +1287,7 @@ static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
     record(c, n, s, 0, false);
     oldD(c, n, s);
 }
+// Map/Unmap/Update: remember writes to small constant buffers.
 static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, UINT s,
                                      D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE *m) {
     HRESULT hr = oldMap(c, r, s, type, flags, m);
@@ -1120,6 +1315,7 @@ static void STDMETHODCALLTYPE update(ID3D11DeviceContext *c, ID3D11Resource *r, 
     }
     oldUpdate(c, r, s, box, data, row, slice);
 }
+// A depth clear starts a new scene: finish the previous one and handle toggles.
 static void STDMETHODCALLTYPE clear(ID3D11DeviceContext *c, ID3D11DepthStencilView *v, UINT flags,
                                     FLOAT z, UINT8 stencil) {
     if (!internal && (!ctx || ctx == c) && (flags & D3D11_CLEAR_DEPTH)) {
@@ -1144,6 +1340,7 @@ static bool patch(void **slot, void *fn) {
     VirtualProtect(slot, sizeof(void *), old, &unused);
     return true;
 }
+// Hooks the shared ID3D11DeviceContext vtable; all hooks or none.
 static bool install(ID3D11DeviceContext *c) {
     void **v = *(void ***)c;
     if (table)
@@ -1153,10 +1350,12 @@ static bool install(ID3D11DeviceContext *c) {
         void *fn;
         void **original;
     };
-    Hook hooks[] = {
-        {12, (void *)drawIndexed, (void **)&oldDI}, {13, (void *)draw, (void **)&oldD},
-        {14, (void *)map, (void **)&oldMap},        {15, (void *)unmap, (void **)&oldUnmap},
-        {48, (void *)update, (void **)&oldUpdate},  {53, (void *)clear, (void **)&oldClear}};
+    Hook hooks[] = {{SLOT_DRAW_INDEXED, (void *)drawIndexed, (void **)&oldDI},
+                    {SLOT_DRAW, (void *)draw, (void **)&oldD},
+                    {SLOT_MAP, (void *)map, (void **)&oldMap},
+                    {SLOT_UNMAP, (void *)unmap, (void **)&oldUnmap},
+                    {SLOT_UPDATE_SUBRESOURCE, (void *)update, (void **)&oldUpdate},
+                    {SLOT_CLEAR_DEPTH_STENCIL_VIEW, (void *)clear, (void **)&oldClear}};
     for (auto &h : hooks)
         *h.original = v[h.slot];
     int done = 0;
@@ -1174,28 +1373,25 @@ static bool install(ID3D11DeviceContext *c) {
     log("D3D11 mesh capture hooks attached; F7 toggles shadows.");
     return true;
 }
-static DWORD attach() {
-    fadeStart = std::clamp((int)GetPrivateProfileIntW(L"Shadows", L"FadeStartPercent", 40,
-                                                      L".\\Mods\\SteamShadows.ini"),
-                           10, 90) *
-                .01f;
-    sunWarmth = std::clamp((int)GetPrivateProfileIntW(L"Shadows", L"SunWarmthPercent", 3,
-                                                      L".\\Mods\\SteamShadows.ini"),
-                           0, 10) *
-                .01f;
-    softShadows =
-        GetPrivateProfileIntW(L"Shadows", L"SoftShadows", 0, L".\\Mods\\SteamShadows.ini") != 0;
-    cloudShadows =
-        GetPrivateProfileIntW(L"Shadows", L"CloudShadows", 1, L".\\Mods\\SteamShadows.ini") != 0;
-    resolution =
-        GetPrivateProfileIntW(L"Shadows", L"Resolution", 4096, L".\\Mods\\SteamShadows.ini");
-    resolution = resolution < 512 ? 512 : resolution > 4096 ? 4096 : resolution;
-    radius = (float)GetPrivateProfileIntW(L"Shadows", L"Radius", 120, L".\\Mods\\SteamShadows.ini");
-    radius = radius < 8 ? 8 : radius > 128 ? 128 : radius;
-    strength =
-        GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 48, L".\\Mods\\SteamShadows.ini") *
+static void loadSettings() {
+    const wchar_t *ini = L".\\Mods\\SteamShadows.ini";
+    fadeStart =
+        std::clamp((int)GetPrivateProfileIntW(L"Shadows", L"FadeStartPercent", 40, ini), 10, 90) *
         .01f;
+    sunWarmth =
+        std::clamp((int)GetPrivateProfileIntW(L"Shadows", L"SunWarmthPercent", 3, ini), 0, 10) *
+        .01f;
+    softShadows = GetPrivateProfileIntW(L"Shadows", L"SoftShadows", 0, ini) != 0;
+    cloudShadows = GetPrivateProfileIntW(L"Shadows", L"CloudShadows", 1, ini) != 0;
+    resolution = GetPrivateProfileIntW(L"Shadows", L"Resolution", 4096, ini);
+    resolution = resolution < 512 ? 512 : resolution > 4096 ? 4096 : resolution;
+    radius = (float)GetPrivateProfileIntW(L"Shadows", L"Radius", 120, ini);
+    radius = radius < 8 ? 8 : radius > 128 ? 128 : radius;
+    strength = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 48, ini) * .01f;
     strength = strength < 0 ? 0 : strength > 1 ? 1 : strength;
+}
+static DWORD attach() {
+    loadSettings();
     ID3D11Device *d = nullptr;
     ID3D11DeviceContext *c = nullptr;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
@@ -1206,6 +1402,11 @@ static DWORD attach() {
     return ok ? 1 : 0;
 }
 } // namespace shadows
+
+// ===========================================================================
+// Entry points (standalone SteamShadows build; MoonandShadow.cpp has its own)
+// ===========================================================================
+
 #ifndef MOON_AND_SHADOW
 class SteamShadows : public GenericMod {
   public:
@@ -1244,6 +1445,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI DisableSteamShadows(void *) {
     shadows::disableRequest = 1;
     return 1;
 }
+// Logs the scene matrices and saves before/after screenshots of the next frame.
 extern "C" __declspec(dllexport) DWORD WINAPI CaptureSteamShadows(void *) {
     shadows::captureLogged = false;
     shadows::captureRequest = 1;
