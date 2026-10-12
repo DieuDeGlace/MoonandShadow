@@ -927,6 +927,9 @@ static void render() {
         float modelScale =
             sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
         p.depthAdjust[1] = !x.terrain && modelScale < .5f ? 1.f : 0.f;
+        // Preserve the accepted sprite self-shadow footprint. The near map
+        // targets terrain; small voxel models retain the stable far-map path.
+        p.cascade[3] = cascadesEnabled && x.terrain ? 1.f : 0.f;
         bind(x, p);
     }
     ID3D11ShaderResourceView *nullViews[2]{};
