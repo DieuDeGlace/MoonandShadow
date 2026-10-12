@@ -7,7 +7,6 @@
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
 #include "../GpuPassTimer.h"
-#include "StableModelShaders.h"
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -46,12 +45,6 @@ static ID3DDeviceContextState *state = nullptr;
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
 static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
 static ID3D11VertexShader *modelReceiver = nullptr;
-static ID3D11PixelShader *nativeModelVisibility = nullptr;
-static ID3D11Buffer *nativeMatrices[3]{}, *nativeOffset = nullptr, *nativeZero = nullptr,
-                                          *inverseCamera = nullptr;
-static float nativeMatrixValues[3][16]{};
-static float nativeOffsetValue = 0;
-static bool nativeValuesKnown = false;
 static ID3D11Buffer *constants = nullptr;
 static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nullptr;
 static bool cascadesEnabled = true;
@@ -65,7 +58,7 @@ static ID3D11DepthStencilView *mapDepth = nullptr;
 static ID3D11ShaderResourceView *mapView = nullptr;
 static ID3D11DepthStencilState *writeDepth = nullptr, *testDepth = nullptr;
 static ID3D11RasterizerState *raster = nullptr, *receiverRaster = nullptr;
-static ID3D11BlendState *blend = nullptr, *opaque = nullptr;
+static ID3D11BlendState *blend = nullptr, *modelBlend = nullptr, *opaque = nullptr;
 static ID3D11SamplerState *sampler = nullptr, *rawSampler = nullptr;
 static ID3D11RenderTargetView *target = nullptr;
 static ID3D11DepthStencilView *depth = nullptr;
@@ -98,7 +91,6 @@ static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped;
 struct Draw {
     ID3D11Buffer *vb = nullptr, *ib = nullptr;
     ID3D11InputLayout *layout = nullptr;
-    ID3D11VertexShader *nativeVS = nullptr;
     UINT stride = 0, offset = 0, ibOffset = 0, count = 0, start = 0;
     INT base = 0;
     DXGI_FORMAT format{};
@@ -107,6 +99,9 @@ struct Draw {
     nativeScene::Chunk terrainInfo{};
     float world[16], view[16], proj[16], light[12];
     float pointLights[80]{};
+    float material[4] = {1, 1, 1, 1};
+    float ambient[4] = {.3f, .3f, .3f, 0};
+    float lightProtection = 0;
     float depthOffset = 0;
 };
 static std::vector<Draw> draws;
@@ -266,14 +261,14 @@ static void refreshTerrain(cube::World *w) {
 }
 struct Params {
     float world[16], view[16], proj[16], light[16], config[4], eye[4], sun[4], points[80],
-        lantern[4], sunTone[4], depthAdjust[4], nearLight[16], cascade[4];
+        lantern[4], sunTone[4], depthAdjust[4], nearLight[16], cascade[4], modelFront[4],
+        modelBack[4], modelAmbient[4], modelDirection[4];
 };
 static void clearDraws() {
     for (auto &x : draws) {
         drop(x.vb);
         drop(x.ib);
         drop(x.layout);
-        drop(x.nativeVS);
     }
     draws.clear();
     drop(target);
@@ -428,14 +423,30 @@ static void compactPointLights(Params &params) {
     params.depthAdjust[3] = 1;
 }
 static const char *hlsl = R"HLSL(
-cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;row_major float4x4 nearLight;float4 cascade;};
-struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
+cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;row_major float4x4 nearLight;float4 cascade,modelFront,modelBack,modelAmbient,modelDirection;};
+struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;
+#ifdef MODEL_DIRECT_LIGHT
+float3 directFraction:TEXCOORD3;
+#endif
+};
 float3 normal(float a){int n=(int)round(a*255);return n==0?float3(1,0,0):n==1?float3(-1,0,0):n==2?float3(0,1,0):n==3?float3(0,-1,0):n==4?float3(0,0,1):float3(0,0,-1);}
-V caster(float4 p:POSITION){V o;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(light,w);o.w=w.xyz;o.n=0;o.local=0;return o;}
+V caster(float4 p:POSITION){V o=(V)0;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(light,w);o.w=w.xyz;return o;}
 // Keep the native y-multiply then x/z/w MAD order. Without precise, FXC
 // swaps the first two terms, producing angle-dependent coplanar triangles.
 float4 combine(row_major float4x4 m,float4 r){precise float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
 V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(world,v);row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2])-float4(0,0,0,depthAdjust.x),v),dot(combine(vw,proj[3]),v));o.w=w.xyz;o.n=normalize(mul((float3x3)world,normal(p.w)));o.local=0;
+#ifdef MODEL_DIRECT_LIGHT
+ // Omega carries world position directly from the same transform as its
+ // caster and uses inverse-transpose model normals. Axis normals allow this
+ // compact cofactor form, including mirrored and nonuniform transforms.
+ float3 a=float3(world[0].x,world[1].x,world[2].x);
+ float3 b=float3(world[0].y,world[1].y,world[2].y);
+ float3 c=float3(world[0].z,world[1].z,world[2].z);
+ float3 n=normal(p.w);
+ float handedness=dot(a,cross(b,c))<0?-1:1;
+ o.n=normalize((cross(b,c)*n.x+cross(c,a)*n.y+cross(a,b)*n.z)*handedness);
+ float3 localColor=0;
+#endif
  // Match native point-light attenuation at vertices; no extra light shadow maps.
  int lightCount=depthAdjust.w>0?(int)depthAdjust.z:10;
  [loop]for(int j=0;j<lightCount;j++)if(pointPositions[j].w>0){
@@ -443,7 +454,23 @@ V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(worl
   float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
   float facing=clamp(-4*dot(o.n,delta*rsqrt(max(d2,.0001))),.3,1);
   o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
- }o.local=saturate(o.local);return o;}
+#ifdef MODEL_DIRECT_LIGHT
+  localColor+=falloff*falloff*facing*pointColors[j].rgb;
+#endif
+ }o.local=saturate(o.local);
+#ifdef MODEL_DIRECT_LIGHT
+ // Separate native sunlight from ambient/back/local light. A shadow may
+ // remove sunlight; it must not multiply all native illumination by 0.25.
+ float orientation=.5+.5*abs(dot(o.n,float3(.597022,.398015,.696526)));
+ float facing=max(0,.3+.7*dot(o.n,modelDirection.xyz));
+ float3 back=modelBack.rgb*orientation;
+ float3 ambient=modelAmbient.rgb*orientation+localColor;
+ float3 full=saturate(ambient+saturate(back+modelFront.rgb*facing)*modelFront.w);
+ float3 indirect=saturate(ambient+saturate(back)*modelFront.w);
+ o.directFraction=saturate((full-indirect)/max(full,.00001))*(1-modelDirection.w);
+#endif
+ return o;}
+V modelReceiverVertex(float4 p:POSITION){return receiver(p);}
 Texture2D<float> shadowMap:register(t0);Texture2D<float> nearShadowMap:register(t1);SamplerComparisonState shadowSampler:register(s0);
 #ifdef MODEL_PLANE_FILTER
 SamplerState rawShadowSampler:register(s1);
@@ -524,7 +551,12 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
  return lit;
 #endif
 }
+#ifdef MODEL_DIRECT_LIGHT
+struct ModelOutput { float4 color:SV_TARGET0; float4 transmission:SV_TARGET1; };
+ModelOutput visibility(V i) {
+#else
 float4 visibility(V i):SV_TARGET{
+#endif
  float facing=dot(normalize(i.n),sun.xyz);float distance=length(i.w.xy-eye.xy);float lit;
  bool useNear=cascade.w>.5;
 #ifdef MODEL_PLANE_FILTER
@@ -545,27 +577,18 @@ float4 visibility(V i):SV_TARGET{
  // stamped a second colored silhouette into the illuminated ground.
  float protection=max(local,lanternProtection);float alpha=opacity*(1-protection);
  float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
- return float4(sunlight,alpha);}
-)HLSL";
-static bool nativeSignatureMatches(ID3DBlob *code) {
-    ID3D11ShaderReflection *reflection = nullptr;
-    if (FAILED(D3DReflect(code->GetBufferPointer(), code->GetBufferSize(),
-                          __uuidof(ID3D11ShaderReflection), (void **)&reflection)))
-        return false;
-    D3D11_SHADER_DESC desc{};
-    reflection->GetDesc(&desc);
-    bool normal = false, position = false;
-    for (UINT i = 0; i < desc.InputParameters; ++i) {
-        D3D11_SIGNATURE_PARAMETER_DESC input{};
-        reflection->GetInputParameterDesc(i, &input);
-        if (!strcmp(input.SemanticName, "TEXCOORD") && input.SemanticIndex == 1)
-            normal = input.Register == 3 && input.Mask == 7;
-        if (!strcmp(input.SemanticName, "TEXCOORD") && input.SemanticIndex == 3)
-            position = input.Register == 5 && input.Mask == 7;
-    }
-    reflection->Release();
-    return normal && position;
+#ifdef MODEL_DIRECT_LIGHT
+ // Two source colors blend into the same target: sunlight is added as before,
+ // while the transmission factor attenuates only the native sunlight share.
+ ModelOutput output;
+ output.color=float4(sunlight,0);
+ output.transmission=float4(saturate(1-alpha*i.directFraction),1);
+ return output;
+#else
+ return float4(sunlight,alpha);
+#endif
 }
+)HLSL";
 static bool initialize(ID3D11DeviceContext *context) {
     if (device)
         return ctx == context && !failed;
@@ -580,59 +603,32 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, levels, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
-    const char *names[] = {"caster",   "receiver",   "visibility",
-                           "receiver", "visibility", "nativeModel"};
-    std::string nativeModelSource = std::string(hlsl) + R"NATIVE(
-cbuffer NativeCamera:register(b1){row_major float4x4 inverseCamera;};
-// Preserve native output register order, including unused fields. D3D11
-// stage linkage cannot compact away COLOR/TEXCOORD gaps in this adapter.
-struct NativeInput{float4 position:SV_POSITION;float4 color:COLOR0;float4 clip:TEXCOORD0;float3 viewNormal:TEXCOORD1;float3 lightDirection:TEXCOORD2;float3 viewPosition:TEXCOORD3;};
-float4 nativeModel(NativeInput input):SV_TARGET{
- V v;v.p=input.position;v.w=mul(inverseCamera,float4(input.viewPosition,1)).xyz;
- v.n=normalize(mul((float3x3)inverseCamera,input.viewNormal));v.local=0;
- int count=depthAdjust.w>0?(int)depthAdjust.z:10;
- [loop]for(int j=0;j<count;j++)if(pointPositions[j].w>0){
-  float3 delta=v.w-pointPositions[j].xyz;float d2=dot(delta,delta);
-  float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
-  float facing=clamp(-4*dot(v.n,delta*rsqrt(max(d2,.0001))),.3,1);
-  v.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
- }v.local=saturate(v.local);
- return visibility(v);
-})NATIVE";
-    for (int i = 0; i < 6 && ok; i++) {
+    const char *names[] = {"caster", "receiver", "visibility", "modelReceiverVertex", "visibility"};
+    const D3D_SHADER_MACRO modelMacros[] = {
+        {"MODEL_PLANE_FILTER", "1"}, {"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
+    for (int i = 0; i < 5 && ok; ++i) {
         ID3DBlob *code = nullptr, *error = nullptr;
-        const char *source = i == 5   ? nativeModelSource.c_str()
-                             : i >= 3 ? stableModelShaders
-                                      : hlsl;
-        const D3D_SHADER_MACRO modelFilter[] = {{"MODEL_PLANE_FILTER", "1"}, {nullptr, nullptr}};
-        HRESULT hr = D3DCompile(source, strlen(source), "SteamShadows",
-                                i == 5 ? modelFilter : nullptr, nullptr, names[i],
-                                (i < 2 || i == 3) ? "vs_4_0"
-                                : i == 5          ? "ps_4_1"
-                                                  : "ps_4_0",
+        bool vertex = i < 2 || i == 3;
+        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", i >= 3 ? modelMacros : nullptr,
+                                nullptr, names[i],
+                                vertex   ? "vs_4_0"
+                                : i == 4 ? "ps_4_1"
+                                         : "ps_4_0",
                                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
         if (error) {
             log((char *)error->GetBufferPointer());
             drop(error);
         }
         ok = SUCCEEDED(hr);
-        if (ok && i == 5) {
-            ok = nativeSignatureMatches(code);
-            if (!ok)
-                log("Native model pixel signature mismatch; initialization rejected.");
-        }
         if (ok)
-            ok = SUCCEEDED((i < 2 || i == 3)
-                               ? device->CreateVertexShader(code->GetBufferPointer(),
-                                                            code->GetBufferSize(), nullptr,
-                                                            i == 3 ? &modelReceiver
-                                                            : i    ? &receiver
-                                                                   : &caster)
-                               : device->CreatePixelShader(code->GetBufferPointer(),
-                                                           code->GetBufferSize(), nullptr,
-                                                           i == 5   ? &nativeModelVisibility
-                                                           : i == 4 ? &modelVisibility
-                                                                    : &visibility));
+            ok = vertex ? SUCCEEDED(device->CreateVertexShader(code->GetBufferPointer(),
+                                                               code->GetBufferSize(), nullptr,
+                                                               i == 3   ? &modelReceiver
+                                                               : i == 1 ? &receiver
+                                                                        : &caster))
+                        : SUCCEEDED(device->CreatePixelShader(
+                              code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                              i == 4 ? &modelVisibility : &visibility));
         if (ok && i == 0) {
             D3D11_INPUT_ELEMENT_DESC element = {
                 "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
@@ -652,18 +648,6 @@ float4 nativeModel(NativeInput input):SV_TARGET{
     cb.Usage = D3D11_USAGE_DEFAULT;
     if (ok)
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &constants));
-    if (ok) {
-        cb.ByteWidth = 64;
-        for (auto &buffer : nativeMatrices)
-            ok = ok && SUCCEEDED(device->CreateBuffer(&cb, nullptr, &buffer));
-        ok = ok && SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inverseCamera));
-        cb.ByteWidth = 16;
-        ok = ok && SUCCEEDED(device->CreateBuffer(&cb, nullptr, &nativeOffset));
-        float zeros[80]{};
-        cb.ByteWidth = sizeof(zeros);
-        D3D11_SUBRESOURCE_DATA initial{zeros, 0, 0};
-        ok = ok && SUCCEEDED(device->CreateBuffer(&cb, &initial, &nativeZero));
-    }
     D3D11_TEXTURE2D_DESC td{};
     td.Width = td.Height = resolution;
     td.MipLevels = td.ArraySize = 1;
@@ -724,6 +708,12 @@ float4 nativeModel(NativeInput input):SV_TARGET{
     rt.RenderTargetWriteMask = 7;
     if (ok)
         ok = SUCCEEDED(device->CreateBlendState(&bd, &blend));
+    // Models keep native ambient/back/point lighting. The pixel shader emits
+    // a per-channel sunlight attenuation multiplier for the existing image.
+    rt.SrcBlend = D3D11_BLEND_ONE;
+    rt.DestBlend = D3D11_BLEND_SRC1_COLOR;
+    if (ok)
+        ok = SUCCEEDED(device->CreateBlendState(&bd, &modelBlend));
     D3D11_SAMPLER_DESC ss{};
     ss.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
     ss.AddressU = ss.AddressV = ss.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
@@ -743,7 +733,7 @@ float4 nativeModel(NativeInput input):SV_TARGET{
         resolution, radius);
     log(ok ? status : "Resource initialization failed; original rendering preserved.");
     if (ok)
-        log("Native model shadows: per-texel receiver-plane comparison, one gather per crisp sample.");
+        log("Model shadows: direct world transforms, inverse-transpose normals, sunlight-only attenuation.");
     if (ok && cascadesEnabled) {
         sprintf_s(
             status,
@@ -855,8 +845,6 @@ struct ReplayBindings {
     UINT uploads = 0, stateChanges = 0;
 };
 static ReplayBindings replayBindings;
-static bool replayingReceivers = false, nativeResourcesBound = false;
-static ID3D11VertexShader *lastNativeShader = nullptr;
 
 static void bind(const Draw &x, Params &p) {
     memcpy(p.world, x.world, 64);
@@ -915,34 +903,6 @@ static void bind(const Draw &x, Params &p) {
             ++bindings.stateChanges;
         }
     }
-    if (internal && replayingReceivers && x.nativeVS && !x.terrain) {
-        const float *values[] = {x.proj, x.view, x.world};
-        for (int i = 0; i < 3; ++i) {
-            if (!nativeValuesKnown || memcmp(nativeMatrixValues[i], values[i], 64)) {
-                oldUpdate(ctx, nativeMatrices[i], 0, nullptr, values[i], 0, 0);
-                memcpy(nativeMatrixValues[i], values[i], 64);
-            }
-        }
-        if (!nativeValuesKnown || nativeOffsetValue != x.depthOffset) {
-            float offset[4] = {x.depthOffset, 0, 0, 0};
-            oldUpdate(ctx, nativeOffset, 0, nullptr, offset, 0, 0);
-            nativeOffsetValue = x.depthOffset;
-        }
-        nativeValuesKnown = true;
-        ID3D11Buffer *buffers[] = {
-            nativeMatrices[0], nativeMatrices[1], nativeMatrices[2], nativeZero,   nativeZero,
-            nativeZero,        nativeZero,        nativeZero,        nativeOffset, nativeZero};
-        if (!nativeResourcesBound) {
-            ctx->VSSetConstantBuffers(0, 10, buffers);
-            ctx->PSSetShader(nativeModelVisibility, nullptr, 0);
-            ctx->PSSetConstantBuffers(1, 1, &inverseCamera);
-            nativeResourcesBound = true;
-        }
-        if (lastNativeShader != x.nativeVS) {
-            ctx->VSSetShader(x.nativeVS, nullptr, 0);
-            lastNativeShader = x.nativeVS;
-        }
-    }
     if (x.indexed)
         oldDI(ctx, x.count, x.start, x.base);
     else
@@ -965,6 +925,12 @@ static bool terrainIntersectsMap(const Draw &draw, const Params &parameters) {
 static void render() {
     if (draws.empty())
         return;
+    // A camera/projection can also belong to the rotating menu preview. Only
+    // native terrain establishes the world origin for the supported game.
+    if (nativeScene::supported() && !frameOriginKnown) {
+        clearDraws();
+        return;
+    }
     if (finished || !enabled || failed || !target || !depth) {
         if (enabled && diagnosticRejects++ < 8) {
             char s[256];
@@ -1092,31 +1058,23 @@ static void render() {
     ctx->PSSetShaderResources(0, 2, shadowViews);
     ID3D11SamplerState *shadowSamplers[] = {sampler, rawSampler};
     ctx->PSSetSamplers(0, 2, shadowSamplers);
-    float inverse[16]{};
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col)
-            inverse[row * 4 + col] = p.view[col * 4 + row];
-        inverse[row * 4 + 3] = -(inverse[row * 4] * p.view[3] + inverse[row * 4 + 1] * p.view[7] +
-                                 inverse[row * 4 + 2] * p.view[11]);
-    }
-    inverse[15] = 1;
-    oldUpdate(ctx, inverseCamera, 0, nullptr, inverse, 0, 0);
-    replayingReceivers = true;
-    nativeResourcesBound = false;
-    lastNativeShader = nullptr;
-    bool modelShaderBound = false, previousNativeModel = false;
+    bool modelShaderBound = false;
     for (auto &x : draws) {
         bool useModelShader = !x.terrain;
-        bool useNativeModel = useModelShader && x.nativeVS;
-        if (!useNativeModel && (useModelShader != modelShaderBound || previousNativeModel)) {
+        if (useModelShader != modelShaderBound) {
             ctx->VSSetShader(useModelShader ? modelReceiver : receiver, nullptr, 0);
             ctx->PSSetShader(useModelShader ? modelVisibility : visibility, nullptr, 0);
-            ctx->VSSetConstantBuffers(0, 1, &constants);
-            nativeResourcesBound = false;
-            lastNativeShader = nullptr;
+            ctx->OMSetBlendState(useModelShader ? modelBlend : blend, nullptr, ~0u);
         }
         modelShaderBound = useModelShader;
-        previousNativeModel = useNativeModel;
+        if (useModelShader) {
+            memcpy(p.modelFront, x.light, 16);
+            memcpy(p.modelBack, x.light + 4, 16);
+            memcpy(p.modelAmbient, x.ambient, 16);
+            memcpy(p.modelDirection, x.light + 8, 16);
+            p.modelFront[3] = x.material[3];
+            p.modelDirection[3] = x.lightProtection;
+        }
         memcpy(p.view, x.view, 64);
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
@@ -1130,7 +1088,6 @@ static void render() {
         p.cascade[3] = cascadesEnabled ? 1.f : 0.f;
         bind(x, p);
     }
-    replayingReceivers = false;
     ID3D11ShaderResourceView *nullViews[2]{};
     ctx->PSSetShaderResources(0, 2, nullViews);
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1235,6 +1192,7 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     bool ok = readBuffer(buffers[0], x.proj, 64) && readBuffer(buffers[1], x.view, 64) &&
               readBuffer(buffers[2], x.world, 64) && readBuffer(buffers[5], x.light, 48);
     readBuffer(buffers[4], x.pointLights, 320);
+    readBuffer(buffers[3], x.material, 16);
     for (auto &b : buffers)
         drop(b);
     if (!ok)
@@ -1322,12 +1280,25 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         frameOriginY = double(x.terrainInfo.zone.y) * 64 - x.world[7];
         frameOriginKnown = true;
     }
-    ID3D11Buffer *offsetBuffer = nullptr;
-    c->VSGetConstantBuffers(8, 1, &offsetBuffer);
     float offsetValues[4]{};
-    if (offsetBuffer && readBuffer(offsetBuffer, offsetValues, 16))
-        x.depthOffset = offsetValues[0];
-    drop(offsetBuffer);
+    if (x.terrain) {
+        ID3D11Buffer *offsetBuffer = nullptr;
+        c->VSGetConstantBuffers(8, 1, &offsetBuffer);
+        readBuffer(offsetBuffer, offsetValues, 16);
+        drop(offsetBuffer);
+    } else {
+        ID3D11Buffer *extraBuffers[4]{};
+        c->VSGetConstantBuffers(6, 4, extraBuffers);
+        readBuffer(extraBuffers[0], x.ambient, 16);
+        float whiteValues[4]{}, glowValues[4]{};
+        readBuffer(extraBuffers[1], whiteValues, 16);
+        readBuffer(extraBuffers[3], glowValues, 16);
+        x.lightProtection = std::clamp(std::max(whiteValues[0], glowValues[0]), 0.f, 1.f);
+        readBuffer(extraBuffers[2], offsetValues, 16);
+        for (auto &b : extraBuffers)
+            drop(b);
+    }
+    x.depthOffset = offsetValues[0];
     D3D11_VIEWPORT vp{};
     UINT vpCount = 1;
     c->RSGetViewports(&vpCount, &vp);
@@ -1351,8 +1322,6 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     x.start = start;
     x.base = base;
     x.indexed = indexed;
-    if (!x.terrain)
-        c->VSGetShader(&x.nativeVS, nullptr, nullptr);
     draws.push_back(x);
     return true;
 }

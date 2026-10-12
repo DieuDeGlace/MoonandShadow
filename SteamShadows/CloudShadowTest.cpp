@@ -56,6 +56,7 @@ int main() {
     c->ClearRenderTargetView(shadows::target, white);
     c->ClearDepthStencilView(shadows::depth, D3D11_CLEAR_DEPTH, .6f, 0);
     shadows::Draw ground{};
+    ground.terrain = true;
     ground.vb = vb;
     vb->AddRef();
     ground.stride = 16;
