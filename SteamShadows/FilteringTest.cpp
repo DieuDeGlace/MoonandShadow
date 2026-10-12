@@ -113,11 +113,11 @@ cbuffer World:register(b2){row_major float4x4 world;};
 cbuffer Offset:register(b8){float offset;};
 float4 combine(row_major float4x4 m,float4 r){precise float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
 float3 normal(float a){int n=(int)round(a*255);return n==0?float3(1,0,0):n==1?float3(-1,0,0):n==2?float3(0,1,0):n==3?float3(0,-1,0):n==4?float3(0,0,1):float3(0,0,-1);}
-struct NativeOutput{float4 p:SV_POSITION;float3 n:TEXCOORD1;float3 v:TEXCOORD3;};
+struct NativeOutput{float4 p:SV_POSITION;float4 color:COLOR0;float4 clip:TEXCOORD0;float3 n:TEXCOORD1;float3 direction:TEXCOORD2;float3 v:TEXCOORD3;};
 NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(packed.xyz*255,1);
  row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));
  o.p=float4(dot(combine(vw,proj[0]),p),dot(combine(vw,proj[1]),p),dot(combine(vw,proj[2])-float4(0,0,0,offset),p),dot(combine(vw,proj[3]),p));
- o.v=mul(vw,p).xyz;o.n=normalize(mul((float3x3)vw,normal(packed.w)));return o;
+ o.v=mul(vw,p).xyz;o.n=normalize(mul((float3x3)vw,normal(packed.w)));o.color=float4(.2,.7,.4,1);o.clip=o.p;o.direction=float3(.1,.4,.8);return o;
 })NATIVE";
     ID3DBlob *nativeCode = nullptr;
     assert(SUCCEEDED(D3DCompile(nativeLike, strlen(nativeLike), "NativeReceiverFixture", nullptr,
@@ -295,7 +295,8 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
     }
     auto modelOccluded = sampleLocal(false, false, false, 4, false, true, true, false, true);
     assert(modelOccluded[0] < 200);
-    puts("Model receivers avoid duplicate directional shading while retaining cast occlusion: PASS");
+    puts(
+        "Model receivers avoid duplicate directional shading while retaining cast occlusion: PASS");
     auto unlit = sampleLocal(false, false), local = sampleLocal(true, false),
          lantern = sampleLocal(false, true);
     assert(local[0] > unlit[0] + 20);

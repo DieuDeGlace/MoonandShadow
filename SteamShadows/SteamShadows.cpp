@@ -5,6 +5,7 @@
 #include "../MoonLight/MoonRules.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <d3d11shader.h>
 #include "../GpuPassTimer.h"
 #include "StableModelShaders.h"
 #include <vector>
@@ -486,6 +487,25 @@ float4 visibility(V i):SV_TARGET{
  float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
  return float4(sunlight,alpha);}
 )HLSL";
+static bool nativeSignatureMatches(ID3DBlob *code) {
+    ID3D11ShaderReflection *reflection = nullptr;
+    if (FAILED(D3DReflect(code->GetBufferPointer(), code->GetBufferSize(),
+                          __uuidof(ID3D11ShaderReflection), (void **)&reflection)))
+        return false;
+    D3D11_SHADER_DESC desc{};
+    reflection->GetDesc(&desc);
+    bool normal = false, position = false;
+    for (UINT i = 0; i < desc.InputParameters; ++i) {
+        D3D11_SIGNATURE_PARAMETER_DESC input{};
+        reflection->GetInputParameterDesc(i, &input);
+        if (!strcmp(input.SemanticName, "TEXCOORD") && input.SemanticIndex == 1)
+            normal = input.Register == 3 && input.Mask == 7;
+        if (!strcmp(input.SemanticName, "TEXCOORD") && input.SemanticIndex == 3)
+            position = input.Register == 5 && input.Mask == 7;
+    }
+    reflection->Release();
+    return normal && position;
+}
 static bool initialize(ID3D11DeviceContext *context) {
     if (device)
         return ctx == context && !failed;
@@ -504,7 +524,9 @@ static bool initialize(ID3D11DeviceContext *context) {
                            "receiver", "visibility", "nativeModel"};
     std::string nativeModelSource = std::string(stableModelShaders) + R"NATIVE(
 cbuffer NativeCamera:register(b1){row_major float4x4 inverseCamera;};
-struct NativeInput{float4 position:SV_POSITION;float3 viewNormal:TEXCOORD1;float3 viewPosition:TEXCOORD3;};
+// Preserve native output register order, including unused fields. D3D11
+// stage linkage cannot compact away COLOR/TEXCOORD gaps in this adapter.
+struct NativeInput{float4 position:SV_POSITION;float4 color:COLOR0;float4 clip:TEXCOORD0;float3 viewNormal:TEXCOORD1;float3 lightDirection:TEXCOORD2;float3 viewPosition:TEXCOORD3;};
 float4 nativeModel(NativeInput input):SV_TARGET{
  V v;v.p=input.position;v.w=mul(inverseCamera,float4(input.viewPosition,1)).xyz;
  v.n=normalize(mul((float3x3)inverseCamera,input.viewNormal));v.local=0;
@@ -534,6 +556,11 @@ float4 nativeModel(NativeInput input):SV_TARGET{
             drop(error);
         }
         ok = SUCCEEDED(hr);
+        if (ok && i == 5) {
+            ok = nativeSignatureMatches(code);
+            if (!ok)
+                log("Native model pixel signature mismatch; initialization rejected.");
+        }
         if (ok)
             ok = SUCCEEDED((i < 2 || i == 3)
                                ? device->CreateVertexShader(code->GetBufferPointer(),
