@@ -287,11 +287,15 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
                 assert(sampleLocal(localLight, lanternLight, true, face, false, true) ==
                        sampleLocal(localLight, lanternLight, true, face, false, true, true, true));
     puts("Compacted local lights match original GPU pixels for all voxel normals: PASS");
-    for (int face = 0; face < 6; ++face)
-        assert(sampleLocal(true, true, true, face, false, true, true, true) ==
-               sampleLocal(true, true, true, face, false, true, true, true, true));
-    puts(
-        "Accepted model shader pixels preserve local lights and occluder shading across all normals: PASS");
+    for (int face = 0; face < 6; ++face) {
+        // The game already lights model faces. An unoccluded model must not
+        // receive another directional darkening overlay on its away faces.
+        auto model = sampleLocal(false, false, false, face, true, true, true, false, true);
+        assert(model[0] > 240 && model[1] > 240 && model[2] > 240);
+    }
+    auto modelOccluded = sampleLocal(false, false, false, 4, false, true, true, false, true);
+    assert(modelOccluded[0] < 200);
+    puts("Model receivers avoid duplicate directional shading while retaining cast occlusion: PASS");
     auto unlit = sampleLocal(false, false), local = sampleLocal(true, false),
          lantern = sampleLocal(false, true);
     assert(local[0] > unlit[0] + 20);
