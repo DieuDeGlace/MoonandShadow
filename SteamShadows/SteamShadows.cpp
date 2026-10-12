@@ -45,6 +45,12 @@ static ID3DDeviceContextState *state = nullptr;
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
 static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
 static ID3D11VertexShader *modelReceiver = nullptr;
+static ID3D11PixelShader *nativeModelVisibility = nullptr;
+static ID3D11Buffer *nativeMatrices[3]{}, *nativeOffset = nullptr, *nativeZero = nullptr,
+                                          *inverseCamera = nullptr;
+static float nativeMatrixValues[3][16]{};
+static float nativeOffsetValue = 0;
+static bool nativeValuesKnown = false;
 static ID3D11Buffer *constants = nullptr;
 static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nullptr;
 static bool cascadesEnabled = true;
@@ -91,6 +97,7 @@ static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped;
 struct Draw {
     ID3D11Buffer *vb = nullptr, *ib = nullptr;
     ID3D11InputLayout *layout = nullptr;
+    ID3D11VertexShader *nativeVS = nullptr;
     UINT stride = 0, offset = 0, ibOffset = 0, count = 0, start = 0;
     INT base = 0;
     DXGI_FORMAT format{};
@@ -265,6 +272,7 @@ static void clearDraws() {
         drop(x.vb);
         drop(x.ib);
         drop(x.layout);
+        drop(x.nativeVS);
     }
     draws.clear();
     drop(target);
@@ -492,10 +500,27 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, levels, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
-    const char *names[] = {"caster", "receiver", "visibility", "receiver", "visibility"};
-    for (int i = 0; i < 5 && ok; i++) {
+    const char *names[] = {"caster",   "receiver",   "visibility",
+                           "receiver", "visibility", "nativeModel"};
+    std::string nativeModelSource = std::string(stableModelShaders) + R"NATIVE(
+cbuffer NativeCamera:register(b1){row_major float4x4 inverseCamera;};
+struct NativeInput{float4 position:SV_POSITION;float3 viewNormal:TEXCOORD1;float3 viewPosition:TEXCOORD3;};
+float4 nativeModel(NativeInput input):SV_TARGET{
+ V v;v.p=input.position;v.w=mul(inverseCamera,float4(input.viewPosition,1)).xyz;
+ v.n=normalize(mul((float3x3)inverseCamera,input.viewNormal));v.local=0;
+ int count=depthAdjust.w>0?(int)depthAdjust.z:10;
+ [loop]for(int j=0;j<count;j++)if(pointPositions[j].w>0){
+  float3 delta=v.w-pointPositions[j].xyz;float d2=dot(delta,delta);
+  float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
+  float facing=clamp(-4*dot(v.n,delta*rsqrt(max(d2,.0001))),.3,1);
+  v.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
+ }v.local=saturate(v.local);return visibility(v);
+})NATIVE";
+    for (int i = 0; i < 6 && ok; i++) {
         ID3DBlob *code = nullptr, *error = nullptr;
-        const char *source = i >= 3 ? stableModelShaders : hlsl;
+        const char *source = i == 5   ? nativeModelSource.c_str()
+                             : i >= 3 ? stableModelShaders
+                                      : hlsl;
         HRESULT hr = D3DCompile(source, strlen(source), "SteamShadows", nullptr, nullptr, names[i],
                                 (i < 2 || i == 3) ? "vs_4_0" : "ps_4_0",
                                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
@@ -505,15 +530,17 @@ static bool initialize(ID3D11DeviceContext *context) {
         }
         ok = SUCCEEDED(hr);
         if (ok)
-            ok = SUCCEEDED(
-                (i < 2 || i == 3)
-                    ? device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                 nullptr,
-                                                 i == 3 ? &modelReceiver
-                                                 : i    ? &receiver
-                                                        : &caster)
-                    : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                nullptr, i == 4 ? &modelVisibility : &visibility));
+            ok = SUCCEEDED((i < 2 || i == 3)
+                               ? device->CreateVertexShader(code->GetBufferPointer(),
+                                                            code->GetBufferSize(), nullptr,
+                                                            i == 3 ? &modelReceiver
+                                                            : i    ? &receiver
+                                                                   : &caster)
+                               : device->CreatePixelShader(code->GetBufferPointer(),
+                                                           code->GetBufferSize(), nullptr,
+                                                           i == 5   ? &nativeModelVisibility
+                                                           : i == 4 ? &modelVisibility
+                                                                    : &visibility));
         if (ok && i == 0) {
             D3D11_INPUT_ELEMENT_DESC element = {
                 "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
@@ -533,6 +560,18 @@ static bool initialize(ID3D11DeviceContext *context) {
     cb.Usage = D3D11_USAGE_DEFAULT;
     if (ok)
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &constants));
+    if (ok) {
+        cb.ByteWidth = 64;
+        for (auto &buffer : nativeMatrices)
+            ok = ok && SUCCEEDED(device->CreateBuffer(&cb, nullptr, &buffer));
+        ok = ok && SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inverseCamera));
+        cb.ByteWidth = 16;
+        ok = ok && SUCCEEDED(device->CreateBuffer(&cb, nullptr, &nativeOffset));
+        float zeros[80]{};
+        cb.ByteWidth = sizeof(zeros);
+        D3D11_SUBRESOURCE_DATA initial{zeros, 0, 0};
+        ok = ok && SUCCEEDED(device->CreateBuffer(&cb, &initial, &nativeZero));
+    }
     D3D11_TEXTURE2D_DESC td{};
     td.Width = td.Height = resolution;
     td.MipLevels = td.ArraySize = 1;
@@ -719,6 +758,8 @@ struct ReplayBindings {
     UINT uploads = 0, stateChanges = 0;
 };
 static ReplayBindings replayBindings;
+static bool replayingReceivers = false, nativeResourcesBound = false;
+static ID3D11VertexShader *lastNativeShader = nullptr;
 
 static void bind(const Draw &x, Params &p) {
     memcpy(p.world, x.world, 64);
@@ -775,6 +816,34 @@ static void bind(const Draw &x, Params &p) {
             bindings.topology = x.topology;
             bindings.haveTopology = true;
             ++bindings.stateChanges;
+        }
+    }
+    if (internal && replayingReceivers && x.nativeVS && !x.terrain) {
+        const float *values[] = {x.proj, x.view, x.world};
+        for (int i = 0; i < 3; ++i) {
+            if (!nativeValuesKnown || memcmp(nativeMatrixValues[i], values[i], 64)) {
+                oldUpdate(ctx, nativeMatrices[i], 0, nullptr, values[i], 0, 0);
+                memcpy(nativeMatrixValues[i], values[i], 64);
+            }
+        }
+        if (!nativeValuesKnown || nativeOffsetValue != x.depthOffset) {
+            float offset[4] = {x.depthOffset, 0, 0, 0};
+            oldUpdate(ctx, nativeOffset, 0, nullptr, offset, 0, 0);
+            nativeOffsetValue = x.depthOffset;
+        }
+        nativeValuesKnown = true;
+        ID3D11Buffer *buffers[] = {
+            nativeMatrices[0], nativeMatrices[1], nativeMatrices[2], nativeZero,   nativeZero,
+            nativeZero,        nativeZero,        nativeZero,        nativeOffset, nativeZero};
+        if (!nativeResourcesBound) {
+            ctx->VSSetConstantBuffers(0, 10, buffers);
+            ctx->PSSetShader(nativeModelVisibility, nullptr, 0);
+            ctx->PSSetConstantBuffers(1, 1, &inverseCamera);
+            nativeResourcesBound = true;
+        }
+        if (lastNativeShader != x.nativeVS) {
+            ctx->VSSetShader(x.nativeVS, nullptr, 0);
+            lastNativeShader = x.nativeVS;
         }
     }
     if (x.indexed)
@@ -925,14 +994,31 @@ static void render() {
     ID3D11ShaderResourceView *shadowViews[] = {mapView, nearView};
     ctx->PSSetShaderResources(0, 2, shadowViews);
     ctx->PSSetSamplers(0, 1, &sampler);
-    bool modelShaderBound = false;
+    float inverse[16]{};
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col)
+            inverse[row * 4 + col] = p.view[col * 4 + row];
+        inverse[row * 4 + 3] = -(inverse[row * 4] * p.view[3] + inverse[row * 4 + 1] * p.view[7] +
+                                 inverse[row * 4 + 2] * p.view[11]);
+    }
+    inverse[15] = 1;
+    oldUpdate(ctx, inverseCamera, 0, nullptr, inverse, 0, 0);
+    replayingReceivers = true;
+    nativeResourcesBound = false;
+    lastNativeShader = nullptr;
+    bool modelShaderBound = false, previousNativeModel = false;
     for (auto &x : draws) {
         bool useModelShader = !x.terrain;
-        if (useModelShader != modelShaderBound) {
+        bool useNativeModel = useModelShader && x.nativeVS;
+        if (!useNativeModel && (useModelShader != modelShaderBound || previousNativeModel)) {
             ctx->VSSetShader(useModelShader ? modelReceiver : receiver, nullptr, 0);
             ctx->PSSetShader(useModelShader ? modelVisibility : visibility, nullptr, 0);
-            modelShaderBound = useModelShader;
+            ctx->VSSetConstantBuffers(0, 1, &constants);
+            nativeResourcesBound = false;
+            lastNativeShader = nullptr;
         }
+        modelShaderBound = useModelShader;
+        previousNativeModel = useNativeModel;
         memcpy(p.view, x.view, 64);
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
@@ -946,6 +1032,7 @@ static void render() {
         p.cascade[3] = cascadesEnabled && x.terrain ? 1.f : 0.f;
         bind(x, p);
     }
+    replayingReceivers = false;
     ID3D11ShaderResourceView *nullViews[2]{};
     ctx->PSSetShaderResources(0, 2, nullViews);
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1166,6 +1253,8 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     x.start = start;
     x.base = base;
     x.indexed = indexed;
+    if (!x.terrain)
+        c->VSGetShader(&x.nativeVS, nullptr, nullptr);
     draws.push_back(x);
     return true;
 }

@@ -14,7 +14,7 @@ static void STDMETHODCALLTYPE directClear(ID3D11DeviceContext *c, ID3D11DepthSte
     c->ClearDepthStencilView(d, f, z, s);
 }
 int main() {
-#ifdef TEST_CASCADES
+#if defined(TEST_CASCADES) || defined(TEST_NATIVE_RECEIVER)
     shadows::cascadesEnabled = true;
     shadows::nearResolution = 128;
     shadows::nearRadius = 25;
@@ -104,6 +104,29 @@ int main() {
     ground.proj[10] = .01f;
     ground.proj[11] = .5f;
     ground.light[10] = 1;
+
+#ifdef TEST_NATIVE_RECEIVER
+    const char *nativeLike = R"NATIVE(
+cbuffer Proj:register(b0){row_major float4x4 proj;};
+cbuffer View:register(b1){row_major float4x4 view;};
+cbuffer World:register(b2){row_major float4x4 world;};
+cbuffer Offset:register(b8){float offset;};
+float4 combine(row_major float4x4 m,float4 r){precise float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
+float3 normal(float a){int n=(int)round(a*255);return n==0?float3(1,0,0):n==1?float3(-1,0,0):n==2?float3(0,1,0):n==3?float3(0,-1,0):n==4?float3(0,0,1):float3(0,0,-1);}
+struct NativeOutput{float4 p:SV_POSITION;float3 n:TEXCOORD1;float3 v:TEXCOORD3;};
+NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(packed.xyz*255,1);
+ row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));
+ o.p=float4(dot(combine(vw,proj[0]),p),dot(combine(vw,proj[1]),p),dot(combine(vw,proj[2])-float4(0,0,0,offset),p),dot(combine(vw,proj[3]),p));
+ o.v=mul(vw,p).xyz;o.n=normalize(mul((float3x3)vw,normal(packed.w)));return o;
+})NATIVE";
+    ID3DBlob *nativeCode = nullptr;
+    assert(SUCCEEDED(D3DCompile(nativeLike, strlen(nativeLike), "NativeReceiverFixture", nullptr,
+                                nullptr, "nativeVS", "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                &nativeCode, nullptr)));
+    assert(SUCCEEDED(d->CreateVertexShader(
+        nativeCode->GetBufferPointer(), nativeCode->GetBufferSize(), nullptr, &ground.nativeVS)));
+    nativeCode->Release();
+#endif
     // Repeated replay binds should issue no redundant uploads or IA changes.
     auto emptyDraw = ground;
     emptyDraw.count = 0;
@@ -124,6 +147,8 @@ int main() {
     shadows::replayBindings = {};
     puts(
         "100 identical replay binds: 1 constant upload and 4 IA changes; changed inputs retained: PASS");
+    if (ground.nativeVS)
+        ground.nativeVS->AddRef();
     shadows::draws.push_back(ground);
     shadows::sceneViewport = {0, 0, 512, 512, 0, 1};
     shadows::CloudCaster cloud{};
@@ -165,6 +190,8 @@ int main() {
     c->ClearDepthStencilView(keptDepth, D3D11_CLEAR_DEPTH, .6f, 0);
     ground.vb->AddRef();
     ground.layout->AddRef();
+    if (ground.nativeVS)
+        ground.nativeVS->AddRef();
     shadows::draws.push_back(ground);
     shadows::softShadows = false;
     shadows::finished = false;
@@ -295,6 +322,7 @@ int main() {
     assert(warmPixel[0] > 135);
     assert(warmPixel[0] > warmPixel[2] + 8);
     puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
+    shadows::drop(ground.nativeVS);
     // A slanted light on a plane with no occluder must not stripe its own surface.
     shadows::clearClouds();
     shadows::target = keptTarget;
@@ -308,6 +336,8 @@ int main() {
     ground.light[10] = .77f;
     ground.vb->AddRef();
     ground.layout->AddRef();
+    if (ground.nativeVS)
+        ground.nativeVS->AddRef();
     shadows::draws.push_back(ground);
     shadows::finished = false;
     shadows::render();
