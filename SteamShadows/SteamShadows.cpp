@@ -456,11 +456,11 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
  if(any(uv<region.x)||any(uv>1-region.x)||p.z<0||p.z>1)return 0;
  // Small sprite faces need a stable normal-derived footprint. Screen
  // derivatives can mix adjacent faces across a pixel quad on these models.
+ float baseBias=region.z;
  if(depthAdjust.y>0){
-  float3 n=normalize(i.n);float denom=max(abs(dot(n,lightTransform[2].xyz)),1e-7);
-  footprint=region.x*(abs(dot(n,lightTransform[0].xyz))+abs(dot(n,lightTransform[1].xyz)))/denom*region.w*region.w*eye.w*eye.w*.5;
+  footprint=0;
+  baseBias=region.z*(1+2*(1-saturate(facing)));
  }
- float baseBias=depthAdjust.y>0?max(region.z,.2*eye.w*.5):region.z;
  float bias=baseBias+min(footprint,region.x*region.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
  [branch]if(sun.w>.5){
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=map.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*region.x,p.z-bias);
@@ -468,7 +468,7 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
  }else lit=map.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
  // A face turned away from the directional light has no direct contribution.
  // Do not let its own depth samples produce alternating bright edge teeth.
- lit*=smoothstep(0,.08,facing);
+ lit*=depthAdjust.y>0?1:smoothstep(0,.08,facing);
  return lit;}
 float4 visibility(V i):SV_TARGET{
  float facing=dot(normalize(i.n),sun.xyz);float distance=length(i.w.xy-eye.xy);float lit;
@@ -522,7 +522,7 @@ static bool initialize(ID3D11DeviceContext *context) {
     drop(d1);
     const char *names[] = {"caster",   "receiver",   "visibility",
                            "receiver", "visibility", "nativeModel"};
-    std::string nativeModelSource = std::string(stableModelShaders) + R"NATIVE(
+    std::string nativeModelSource = std::string(hlsl) + R"NATIVE(
 cbuffer NativeCamera:register(b1){row_major float4x4 inverseCamera;};
 // Preserve native output register order, including unused fields. D3D11
 // stage linkage cannot compact away COLOR/TEXCOORD gaps in this adapter.
@@ -537,10 +537,6 @@ float4 nativeModel(NativeInput input):SV_TARGET{
   float facing=clamp(-4*dot(v.n,delta*rsqrt(max(d2,.0001))),.3,1);
   v.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
  }v.local=saturate(v.local);
- // Keep lookup just outside the model surface. The native raster position
- // stays untouched; this avoids sampling the model's own adjacent voxel depth.
- float normalOffset=min(2*config.x*config.w,.08);
- v.w+=v.n*normalOffset;
  return visibility(v);
 })NATIVE";
     for (int i = 0; i < 6 && ok; i++) {
@@ -1059,9 +1055,9 @@ static void render() {
         // Native models use varied scales. Selecting their tolerance by scale
         // can leave parts of the same actor on the terrain self-shadow path.
         p.depthAdjust[1] = x.terrain ? 0.f : 1.f;
-        // Preserve the accepted sprite self-shadow footprint. The near map
-        // targets terrain; small voxel models retain the stable far-map path.
-        p.cascade[3] = cascadesEnabled && x.terrain ? 1.f : 0.f;
+        // Native model linkage is verified; close models can now use the
+        // focused map, retaining hair/armor contact shadows at finer density.
+        p.cascade[3] = cascadesEnabled ? 1.f : 0.f;
         bind(x, p);
     }
     replayingReceivers = false;

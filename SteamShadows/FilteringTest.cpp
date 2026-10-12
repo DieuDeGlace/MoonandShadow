@@ -209,7 +209,8 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
     // Exercise actual receiver pixels against the existing caster depth map.
     auto sampleLocal = [&](bool nativeLight, bool lantern, bool warm = false, int face = 4,
                            bool outside = false, bool entity = false, bool cached = false,
-                           bool compact = false, bool stableModel = false) {
+                           bool compact = false, bool stableModel = false, bool nativePath = false,
+                           float contactGap = -1) {
         for (auto &v : vertices)
             v[3] = face / 255.f;
         c->UpdateSubresource(vb, 0, nullptr, vertices, 0, 0);
@@ -221,7 +222,7 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
         if (warm)
             params.sunTone[0] = .08f;
         params.depthAdjust[1] = entity ? 1.f : 0.f;
-        if (entity)
+        if (entity && !nativePath)
             params.cascade[3] = 0;
         if (nativeLight) {
             for (int slot : {1, 4, 8}) {
@@ -240,6 +241,12 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
             shadows::compactPointLights(params);
             assert(params.depthAdjust[2] == (nativeLight ? 3.f : 0.f));
         }
+        if (contactGap >= 0) {
+            float closestDepth = params.light[11] - contactGap * params.eye[3] * .5f;
+            c->ClearDepthStencilView(shadows::mapDepth, D3D11_CLEAR_DEPTH, closestDepth, 0);
+            if (shadows::nearDepth)
+                c->ClearDepthStencilView(shadows::nearDepth, D3D11_CLEAR_DEPTH, closestDepth, 0);
+        }
         ID3DDeviceContextState *old = nullptr;
         shadows::ctx1->SwapDeviceContextState(shadows::state, &old);
         c->OMSetRenderTargets(1, &keptTarget, keptDepth);
@@ -256,7 +263,24 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
         c->PSSetSamplers(0, 1, &shadows::sampler);
         shadows::internal = cached;
         shadows::replayBindings = {};
+        if (nativePath) {
+            float inverse[16]{};
+            for (int r = 0; r < 3; ++r) {
+                for (int col = 0; col < 3; ++col)
+                    inverse[r * 4 + col] = ground.view[col * 4 + r];
+                inverse[r * 4 + 3] =
+                    -(inverse[r * 4] * ground.view[3] + inverse[r * 4 + 1] * ground.view[7] +
+                      inverse[r * 4 + 2] * ground.view[11]);
+            }
+            inverse[15] = 1;
+            c->UpdateSubresource(shadows::inverseCamera, 0, nullptr, inverse, 0, 0);
+            shadows::internal = true;
+            shadows::replayingReceivers = true;
+            shadows::nativeResourcesBound = false;
+            shadows::lastNativeShader = nullptr;
+        }
         shadows::bind(ground, params);
+        shadows::replayingReceivers = false;
         shadows::internal = false;
         shadows::replayBindings = {};
         ID3D11ShaderResourceView *nullViews[2]{};
@@ -269,6 +293,14 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
         auto pixel = (unsigned char *)mapped.pData + 256 * mapped.RowPitch +
                      ((warm || outside) ? 168 : 256) * 4;
         std::array<int, 3> result{pixel[0], pixel[1], pixel[2]};
+        if (nativePath && contactGap >= 0) {
+            for (int y = 248; y < 264; ++y)
+                for (int x = 248; x < 264; ++x) {
+                    auto sample = (unsigned char *)mapped.pData + y * mapped.RowPitch + x * 4;
+                    for (int channel = 0; channel < 3; ++channel)
+                        assert(abs(sample[channel] - result[channel]) <= 1);
+                }
+        }
         c->Unmap(staging, 0);
         return result;
     };
@@ -327,6 +359,14 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
     assert(warmPixel[0] > 135);
     assert(warmPixel[0] > warmPixel[2] + 8);
     puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
+#ifdef TEST_NATIVE_RECEIVER
+    auto cleanFace = sampleLocal(false, false, false, 4, false, true, true, false, false, true, 0);
+    auto closeHair =
+        sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f);
+    assert(cleanFace[0] > 240 && closeHair[0] < 200);
+    puts(
+        "Native model: uniform unoccluded face and continuous 0.08-block contact shadow retained PASS");
+#endif
     shadows::drop(ground.nativeVS);
     // A slanted light on a plane with no occluder must not stripe its own surface.
     shadows::clearClouds();
