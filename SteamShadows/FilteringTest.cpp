@@ -260,7 +260,8 @@ NativeOutput nativeVS(float4 packed:POSITION){NativeOutput o;float4 p=float4(pac
         c->PSSetConstantBuffers(0, 1, &shadows::constants);
         ID3D11ShaderResourceView *maps[] = {shadows::mapView, shadows::nearView};
         c->PSSetShaderResources(0, 2, maps);
-        c->PSSetSamplers(0, 1, &shadows::sampler);
+        ID3D11SamplerState *shadowSamplers[] = {shadows::sampler, shadows::rawSampler};
+        c->PSSetSamplers(0, 2, shadowSamplers);
         shadows::internal = cached;
         shadows::replayBindings = {};
         if (nativePath) {

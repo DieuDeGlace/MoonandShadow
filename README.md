@@ -24,13 +24,13 @@ Supports the inspected Steam executable (PE timestamp 0x5d93ab0d, image size 0x5
 
 Palette/desaturation now lives in [alpha-lookalike](https://github.com/DieuDeGlace/alpha-lookalike), a separate loader DLL. MoonandShadow applies no fullscreen color grade. Install alpha-lookalike only if wanted. ReShade remains untouched. The optional FinishWorldLighting export allows the palette to finish moon/shadow rendering before grading regardless of hook installation order.
 
-SunWarmthPercent=3 retains the small warm sunlit contribution in the existing shadow receiver. FadeStartPercent=40 starts a smooth directional-shadow fade at 40% of Radius and reaches zero at Radius (48–120 blocks with Radius=120). This is a reference-inspired distance fade, not a change to shadow-map blur. The shadow map is now 4096 in the supplied preset; this fade adds no map or pass.
+SunWarmthPercent=3 retains the small warm sunlit contribution in the existing shadow receiver. FadeStartPercent=40 starts a smooth directional-shadow fade at 40% of Radius and reaches zero at Radius (48â€“120 blocks with Radius=120). This is a reference-inspired distance fade, not a change to shadow-map blur. The shadow map is now 4096 in the supplied preset; this fade adds no map or pass.
 
 Lantern correction retains native illumination and suppresses added directional darkening near the player over the existing 12-block radius. No local-light shadow maps or occlusion tracing are added. Five moon/shadow tests pass; gameplay appearance and performance require live verification.
 
 ## 120-block shadow update
 
-The default map is 4096×4096 with Radius=120. D32 shadow storage rises from 36 MiB (3072) to 64 MiB; the map has about 1.78 times as many texels. Higher resolution reduces shadow-map stair stepping while retaining the inexpensive hardware comparison filter. It does not eliminate voxel geometry steps or all screen aliasing. Larger caster coverage can cost more GPU time; FPS needs live verification.
+The default map is 4096Ã—4096 with Radius=120. D32 shadow storage rises from 36 MiB (3072) to 64 MiB; the map has about 1.78 times as many texels. Higher resolution reduces shadow-map stair stepping while retaining the inexpensive hardware comparison filter. It does not eliminate voxel geometry steps or all screen aliasing. Larger caster coverage can cost more GPU time; FPS needs live verification.
 
 The receiver no longer rejects faces pointing sideways/away from the directional light or fades their shadows based on face angle. All six voxel normals now receive occluder shadows; angle remains relevant to sunlight warmth and local lights. Grazing-face depth bias is bounded more tightly to avoid withdrawing shadows from block sides. Existing lantern protection and distance fade are retained.
 
@@ -43,3 +43,11 @@ Receiver-plane anti-acne correction: shadow UV/depth derivatives estimate the co
 ## Cascaded shadow test branch
 
 Use `test/cascaded-shadows` for the two-map experiment and pair it with WorldMotion from the same branch in SteamCubeWorldMods. `Cascades=1`, `NearResolution=2048`, and `NearRadius=32` are experimental defaults. Set `Cascades=0` before restarting for the single-map comparison. Main is unchanged. Keep stable TemporalAA installed; no SMAA or depth-reprojection build is required.
+
+### Model contact-shadow test
+
+The model pixel adapter uses a receiver-plane depth comparison at each of the four texels in its bilinear shadow footprint. The previous comparison used one depth reference for all four texels; on slanted model faces, some of those texels belonged to the same face but failed the comparison, creating repeating stripes. The new filter retains the small world-space bias so nearby hair and armor can still cast contact shadows. Near-map coverage is checked before selecting it; models outside its projected coverage use the far map.
+
+The crisp preset replaces one hardware comparison lookup with one raw depth gather and four arithmetic comparisons, in the existing receiver pass. Map resolution, terrain filtering, caster count, shadow darkness, sunlight warmth, and local-light protection are retained. This adds arithmetic for model pixels, not another rendering pass or shadow texture; live GPU timing and visual verification are still required. The native-model pixel shader uses Shader Model 4.1 (Direct3D feature level 10.1 or higher). [Microsoft documents the gather ordering](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/gather4--sm4-1---asm-).
+
+`ModelPlaneTest` sweeps both depth-slope directions, four subtexel phases, and the actual near/far map densities. It checks uniform visibility on a slanted face and continuous occlusion from a plane only 0.08 blocks away. The previous shader fails all 16 unoccluded cases; the revised filter passes all 32 cases. These controlled GPU checks establish the sampling correction, not final appearance in every live scene. `NativeReceiverTest` also retains checks for native shader linkage, local lights, and close model occlusion.

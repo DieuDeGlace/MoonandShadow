@@ -66,7 +66,7 @@ static ID3D11ShaderResourceView *mapView = nullptr;
 static ID3D11DepthStencilState *writeDepth = nullptr, *testDepth = nullptr;
 static ID3D11RasterizerState *raster = nullptr, *receiverRaster = nullptr;
 static ID3D11BlendState *blend = nullptr, *opaque = nullptr;
-static ID3D11SamplerState *sampler = nullptr;
+static ID3D11SamplerState *sampler = nullptr, *rawSampler = nullptr;
 static ID3D11RenderTargetView *target = nullptr;
 static ID3D11DepthStencilView *depth = nullptr;
 static D3D11_VIEWPORT sceneViewport{};
@@ -445,7 +445,59 @@ V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(worl
   o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
  }o.local=saturate(o.local);return o;}
 Texture2D<float> shadowMap:register(t0);Texture2D<float> nearShadowMap:register(t1);SamplerComparisonState shadowSampler:register(s0);
-float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Texture2D<float> map){float3 p=mul(lightTransform,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
+#ifdef MODEL_PLANE_FILTER
+SamplerState rawShadowSampler:register(s1);
+// Hardware PCF compares four depths to one reference. On a tilted model face,
+// that shadows alternating portions of the face's own texels. A single gather
+// keeps the same 2x2 footprint but compares each texel to its receiver plane.
+float planeComparison(Texture2D<float> map, float2 uv, float z, float2 gradient,
+                      float texel, float baseBias, float2 offset) {
+    float2 grid = (uv + offset * texel) / texel - .5;
+    float2 fraction = frac(grid);
+    float2 lower = floor(grid);
+    float2 delta = (lower + .5) * texel - uv;
+    float reference = z + dot(gradient, delta) - baseBias;
+    // Gather order is lower-left, lower-right, upper-right, upper-left.
+    // Gather at the quad's center so hardware coordinate rounding cannot
+    // select a neighboring quad at a subtexel boundary. Weights stay unsnapped.
+    float4 depths = map.Gather(rawShadowSampler, (lower + 1) * texel);
+    float4 references = reference + texel * float4(gradient.y, gradient.x + gradient.y,
+                                                  gradient.x, 0);
+    float4 taps = step(references, depths);
+    return lerp(lerp(taps.w, taps.z, fraction.x), lerp(taps.x, taps.y, fraction.x), fraction.y);
+}
+bool modelMapCovered(float3 worldPosition, row_major float4x4 transform, float texel) {
+    float3 p = mul(transform, float4(worldPosition, 1)).xyz;
+    return all(abs(p.xy) < 1 - 2 * texel) && p.z >= 0 && p.z <= 1;
+}
+float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Texture2D<float> map) {
+    if (!modelMapCovered(i.w, transform, region.x))
+        return 1;
+    float3 p = mul(transform, float4(i.w, 1)).xyz;
+    float2 uv = float2(p.x, -p.y) * .5 + .5;
+    // Signed plane gradient in shadow UV coordinates. The orthographic rows
+    // carry their own scale; eye.w is twice the inverse light-depth span.
+    float denominator = dot(i.n, transform[2].xyz);
+    denominator = (denominator < 0 ? -1 : 1) * max(abs(denominator), eye.w * .0005);
+    float factor = region.w * region.w * eye.w * eye.w * .5 / denominator;
+    float2 gradient = float2(-dot(i.n, transform[0].xyz), dot(i.n, transform[1].xyz)) * factor;
+    float facing = dot(normalize(i.n), sun.xyz);
+    float baseBias = region.z * (1 + 2 * (1 - saturate(facing)));
+    [branch] if (sun.w > .5) {
+        float lit = 0;
+        [unroll] for (int y = -1; y <= 1; y++)
+            [unroll] for (int x = -1; x <= 1; x++)
+                lit += planeComparison(map, uv, p.z, gradient, region.x, baseBias, float2(x, y));
+        return lit / 9;
+    }
+    return planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
+}
+#endif
+float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Texture2D<float> map){
+#ifdef MODEL_PLANE_FILTER
+ return modelPlaneVisibility(i,lightTransform,region,map);
+#else
+ float3 p=mul(lightTransform,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
  float facing=dot(normalize(i.n),sun.xyz);
  // Receiver-plane depth change across the comparison sampler footprint.
  float2 ux=ddx(uv),uy=ddy(uv);float zx=ddx(p.z),zy=ddy(p.z);
@@ -469,12 +521,20 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
  // A face turned away from the directional light has no direct contribution.
  // Do not let its own depth samples produce alternating bright edge teeth.
  lit*=depthAdjust.y>0?1:smoothstep(0,.08,facing);
- return lit;}
+ return lit;
+#endif
+}
 float4 visibility(V i):SV_TARGET{
  float facing=dot(normalize(i.n),sun.xyz);float distance=length(i.w.xy-eye.xy);float lit;
- [branch]if(cascade.w>.5&&distance<cascade.z)lit=shadowVisibility(i,nearLight,float4(cascade.x,config.y,config.z,cascade.y),nearShadowMap);
+ bool useNear=cascade.w>.5;
+#ifdef MODEL_PLANE_FILTER
+ // Tall models inside the XY radius can lie outside the projected near map.
+ // Use the far map there instead of applying a false dark border.
+ useNear=useNear&&modelMapCovered(i.w,nearLight,cascade.x);
+#endif
+ [branch]if(useNear&&distance<cascade.z)lit=shadowVisibility(i,nearLight,float4(cascade.x,config.y,config.z,cascade.y),nearShadowMap);
  else{lit=shadowVisibility(i,light,config,shadowMap);
-  [branch]if(cascade.w>.5&&distance<cascade.y){float nearLit=shadowVisibility(i,nearLight,float4(cascade.x,config.y,config.z,cascade.y),nearShadowMap);lit=lerp(nearLit,lit,smoothstep(cascade.z,cascade.y,distance));}}
+  [branch]if(useNear&&distance<cascade.y){float nearLit=shadowVisibility(i,nearLight,float4(cascade.x,config.y,config.z,cascade.y),nearShadowMap);lit=lerp(nearLit,lit,smoothstep(cascade.z,cascade.y,distance));}}
  float fade=1-smoothstep(config.w*sunTone.y,config.w,length(i.w.xy-eye.xy));float opacity=(1-lit)*config.y*fade;
  float local=saturate(i.local);float lanternProtection=0;
  if(lantern.w>0){float3 delta=i.w-lantern.xyz;float d2=dot(delta,delta);
@@ -544,8 +604,12 @@ float4 nativeModel(NativeInput input):SV_TARGET{
         const char *source = i == 5   ? nativeModelSource.c_str()
                              : i >= 3 ? stableModelShaders
                                       : hlsl;
-        HRESULT hr = D3DCompile(source, strlen(source), "SteamShadows", nullptr, nullptr, names[i],
-                                (i < 2 || i == 3) ? "vs_4_0" : "ps_4_0",
+        const D3D_SHADER_MACRO modelFilter[] = {{"MODEL_PLANE_FILTER", "1"}, {nullptr, nullptr}};
+        HRESULT hr = D3DCompile(source, strlen(source), "SteamShadows",
+                                i == 5 ? modelFilter : nullptr, nullptr, names[i],
+                                (i < 2 || i == 3) ? "vs_4_0"
+                                : i == 5          ? "ps_4_1"
+                                                  : "ps_4_0",
                                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
         if (error) {
             log((char *)error->GetBufferPointer());
@@ -668,6 +732,9 @@ float4 nativeModel(NativeInput input):SV_TARGET{
     ss.MaxLOD = D3D11_FLOAT32_MAX;
     if (ok)
         ok = SUCCEEDED(device->CreateSamplerState(&ss, &sampler));
+    ss.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (ok)
+        ok = SUCCEEDED(device->CreateSamplerState(&ss, &rawSampler));
     failed = !ok;
     char status[256];
     sprintf_s(
@@ -675,6 +742,8 @@ float4 nativeModel(NativeInput input):SV_TARGET{
         "D3D11 sun shadow resources ready (%u, radius=%.0f, loader API 7.3); loaded terrain casters and cached cloud casters enabled.",
         resolution, radius);
     log(ok ? status : "Resource initialization failed; original rendering preserved.");
+    if (ok)
+        log("Native model shadows: per-texel receiver-plane comparison, one gather per crisp sample.");
     if (ok && cascadesEnabled) {
         sprintf_s(
             status,
@@ -1021,7 +1090,8 @@ static void render() {
     ctx->PSSetShader(visibility, nullptr, 0);
     ID3D11ShaderResourceView *shadowViews[] = {mapView, nearView};
     ctx->PSSetShaderResources(0, 2, shadowViews);
-    ctx->PSSetSamplers(0, 1, &sampler);
+    ID3D11SamplerState *shadowSamplers[] = {sampler, rawSampler};
+    ctx->PSSetSamplers(0, 2, shadowSamplers);
     float inverse[16]{};
     for (int row = 0; row < 3; ++row) {
         for (int col = 0; col < 3; ++col)
