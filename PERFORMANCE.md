@@ -11,3 +11,11 @@ These measure GPU execution of the named passes, not total frame time, CPU captu
 ## Receiver local lights
 
 Receiver parameters compact active native point lights in their original order. The vertex shader iterates only active slots instead of testing ten slots on every vertex. Position, radius, color, attenuation, and accumulation order are preserved; lantern protection is unchanged. No shadow quality setting changes. GPU tests compare compacted and original pixels across six normals, with sparse local lights and lantern combinations. Expected savings depend on mesh complexity and active-light count; in-game timing is still needed.
+
+## Cascaded-shadow experiment
+
+`test/cascaded-shadows` retains the 4096 map at radius 120 and adds a 2048 near map at radius 32. Both are independently texel-snapped. A blended overlap covers the outer fifth of the near region. The receiver geometry is replayed once; only the overlap samples both maps. Loaded terrain is conservatively culled in light space for the near pass, including tall chunks and low-angle light. Existing replay binding/constant reuse remains active. This is an independent camera-centered two-map implementation of the cascade principle; it does not copy Omega code or reproduce its complete renderer.
+
+The near map adds approximately 16 MiB of depth texture memory and another caster pass. Timings include both maps. No actual FPS gain or visual parity is established by the automated tests. Tests cover original single-map behavior and the active two-map path with voxel normals, point lights, lanterns, bias and cloud casting.
+
+The matching WorldMotion test branch provides one animation timestamp per scene depth boundary, shared by native leaves/clouds and shadow sampling. This prevents a 33 ms animation tick from changing geometry midway through a scene. Offscreen animation and live movement still require verification. Stable TAA is retained; the rejected SMAA/depth-reprojection DLL is not part of this test.

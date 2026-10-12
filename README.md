@@ -39,3 +39,7 @@ Side shading correction: faces turned away from the directional light now have a
 Shadow attachment correction: depth bias is now 0.008 world blocks divided by the actual light depth span, rather than a fixed normalized-depth bias. The former 0.0002 bias represented about 0.41 blocks with the 2048-block cloud-enabled depth span, causing detached contact shadows. Grazing-angle bias is also reduced and capped. Resolution/range are unchanged. Smaller bias can expose self-shadow acne; targeted tests pass but live tree/voxel-face verification is required.
 
 Receiver-plane anti-acne correction: shadow UV/depth derivatives estimate the comparison sampler footprint, replacing the undersized angle bias that exposed diagonal self-shadow stripes. The small world-unit minimum remains. PCF uses a wider footprint allowance. An actual GPU test now checks that an unoccluded plane under an angled light has no dark stripe pixels. No extra render pass, texture or shadow samples are added; in-game contact and performance still need verification.
+
+## Cascaded shadow test branch
+
+Use `test/cascaded-shadows` for the two-map experiment and pair it with WorldMotion from the same branch in SteamCubeWorldMods. `Cascades=1`, `NearResolution=2048`, and `NearRadius=32` are experimental defaults. Set `Cascades=0` before restarting for the single-map comparison. Main is unchanged. Keep stable TemporalAA installed; no SMAA or depth-reprojection build is required.

@@ -14,6 +14,13 @@ static void STDMETHODCALLTYPE directClear(ID3D11DeviceContext *c, ID3D11DepthSte
     c->ClearDepthStencilView(d, f, z, s);
 }
 int main() {
+#ifdef TEST_CASCADES
+    shadows::cascadesEnabled = true;
+    shadows::nearResolution = 128;
+    shadows::nearRadius = 25;
+#else
+    shadows::cascadesEnabled = false;
+#endif
     ID3D11Device *d = nullptr;
     ID3D11DeviceContext *c = nullptr;
     assert(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
@@ -215,15 +222,16 @@ int main() {
         c->PSSetShader(shadows::visibility, nullptr, 0);
         c->VSSetConstantBuffers(0, 1, &shadows::constants);
         c->PSSetConstantBuffers(0, 1, &shadows::constants);
-        c->PSSetShaderResources(0, 1, &shadows::mapView);
+        ID3D11ShaderResourceView *maps[] = {shadows::mapView, shadows::nearView};
+        c->PSSetShaderResources(0, 2, maps);
         c->PSSetSamplers(0, 1, &shadows::sampler);
         shadows::internal = cached;
         shadows::replayBindings = {};
         shadows::bind(ground, params);
         shadows::internal = false;
         shadows::replayBindings = {};
-        ID3D11ShaderResourceView *nullView = nullptr;
-        c->PSSetShaderResources(0, 1, &nullView);
+        ID3D11ShaderResourceView *nullViews[2]{};
+        c->PSSetShaderResources(0, 2, nullViews);
         c->OMSetRenderTargets(0, nullptr, nullptr);
         shadows::ctx1->SwapDeviceContextState(old, nullptr);
         shadows::drop(old);
