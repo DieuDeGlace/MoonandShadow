@@ -449,7 +449,7 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
   float3 n=normalize(i.n);float denom=max(abs(dot(n,lightTransform[2].xyz)),1e-7);
   footprint=region.x*(abs(dot(n,lightTransform[0].xyz))+abs(dot(n,lightTransform[1].xyz)))/denom*region.w*region.w*eye.w*eye.w*.5;
  }
- float baseBias=depthAdjust.y>0?max(region.z,.1*eye.w*.5):region.z;
+ float baseBias=depthAdjust.y>0?max(region.z,.2*eye.w*.5):region.z;
  float bias=baseBias+min(footprint,region.x*region.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
  [branch]if(sun.w>.5){
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=map.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*region.x,p.z-bias);
@@ -924,9 +924,9 @@ static void render() {
         memcpy(p.points, x.pointLights, sizeof(p.points));
         compactPointLights(p);
         p.depthAdjust[0] = x.depthOffset;
-        float modelScale =
-            sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
-        p.depthAdjust[1] = !x.terrain && modelScale < .5f ? 1.f : 0.f;
+        // Native models use varied scales. Selecting their tolerance by scale
+        // can leave parts of the same actor on the terrain self-shadow path.
+        p.depthAdjust[1] = x.terrain ? 0.f : 1.f;
         // Preserve the accepted sprite self-shadow footprint. The near map
         // targets terrain; small voxel models retain the stable far-map path.
         p.cascade[3] = cascadesEnabled && x.terrain ? 1.f : 0.f;
