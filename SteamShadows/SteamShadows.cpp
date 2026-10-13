@@ -682,12 +682,20 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
 #ifdef MODEL_PLANE_FILTER
     return modelPlaneVisibility(i,lightTransform,region,map);
 #else
+    float facing=dot(normalize(i.n),sun.xyz);
+    // Terrain faces the light only grazes (vertical cliff sides near noon)
+    // project thinner than a shadow texel and self-shadow in stripes. Like
+    // models, give them one consistent directional shade; faces lit at more
+    // than ~17 degrees (ground, tops) keep normal occluder shadows.
+    float exposure=depthAdjust.y>0?1:smoothstep(.15,.30,facing);
     float3 p=mul(lightTransform,float4(i.w,1)).xyz;
     float2 uv=float2(p.x,-p.y)*.5+.5;
-    float facing=dot(normalize(i.n),sun.xyz);
     // Receiver-plane depth change across the comparison sampler footprint.
+    // Derivatives come before any early return: a 2x2 quad can span faces
+    // with different exposure (cliff edges), where they would be undefined.
     float2 ux=ddx(uv),uy=ddy(uv);
     float zx=ddx(p.z),zy=ddy(p.z);
+    [branch]if(exposure<=0)return 0;
     float det=ux.x*uy.y-ux.y*uy.x;
     float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
     float footprint=region.x*region.w*eye.w*min(slope,8);
@@ -695,11 +703,10 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
     if(any(uv<region.x)||any(uv>1-region.x)||p.z<0||p.z>1)return 0;
     // Small sprite faces need a stable normal-derived footprint. Screen
     // derivatives can mix adjacent faces across a pixel quad on these models.
-    float baseBias=region.z;
-    if(depthAdjust.y>0){
+    // Slope-scaled base bias (as models use) for faces just past the grazing band.
+    float baseBias=region.z*(1+2*(1-saturate(facing)));
+    if(depthAdjust.y>0)
         footprint=0;
-        baseBias=region.z*(1+2*(1-saturate(facing)));
-    }
     float bias=baseBias+min(footprint,region.x*region.w*eye.w*16)*(sun.w>.5?2.1:1.1);
     float lit=0;
     [branch]if(sun.w>.5){
@@ -709,10 +716,9 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
                 lit+=map.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*region.x,p.z-bias);
         lit/=9;
     }else lit=map.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
-    // A face turned away from the directional light has no direct contribution.
-    // Do not let its own depth samples produce alternating bright edge teeth.
-    lit*=depthAdjust.y>0?1:smoothstep(0,.08,facing);
-    return lit;
+    // Faces turned away or grazing have little or no direct contribution; this
+    // also keeps their own depth samples from producing bright edge teeth.
+    return lit*exposure;
 #endif
 }
 
