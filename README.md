@@ -20,6 +20,12 @@ Close Steam Cube World, remove MoonLight.dll and SteamShadows.dll from Mods, and
 
 Supports the inspected Steam executable (PE timestamp 0x5d93ab0d, image size 0x5b7000); Alpha and Omega executables are unsupported. Moon and sun share one shadow map. GPU tests check rendering resources, filtering, cloud casting and moon rendering; they do not guarantee FPS or visual correctness in every location.
 
+## Shadow darkness
+
+Shadows match the unmodified game's own dark side. Every shadowed surface (terrain and models) loses only the direct-sunlight part of the game's lighting, using the same formula as the native world vertex shader. With `StrengthPercent=100` (the default), a sunlit surface in shadow is exactly as dark as a block face turned away from the sun; ambient, back and lantern/point light are kept, so the darkness follows the game's own day/night lighting. Lower values remove only that share of the sunlight.
+
+Shadows keep full strength while the sun or moon is more than about 14.5° above the horizon and fade out below that, so the switch between sun and moon stays smooth.
+
 ## Appearance and fade
 
 Palette/desaturation now lives in [alpha-lookalike](https://github.com/DieuDeGlace/alpha-lookalike), a separate loader DLL. MoonandShadow applies no fullscreen color grade. Install alpha-lookalike only if wanted. ReShade remains untouched. The optional FinishWorldLighting export allows the palette to finish moon/shadow rendering before grading regardless of hook installation order.

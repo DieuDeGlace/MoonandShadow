@@ -104,6 +104,8 @@ int main() {
     ground.proj[0] = ground.proj[5] = 1.f / 50;
     ground.proj[10] = .01f;
     ground.proj[11] = .5f;
+    // Native sunlight (front colour) for the direct-light receivers to remove.
+    ground.light[0] = ground.light[1] = ground.light[2] = .8f;
     ground.light[10] = 1;
 
     // Repeated replay binds should issue no redundant uploads or IA changes.

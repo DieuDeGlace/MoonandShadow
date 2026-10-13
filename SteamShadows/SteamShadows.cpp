@@ -57,9 +57,9 @@ constexpr UINT SLOT_DRAW_INDEXED = 12, SLOT_DRAW = 13, SLOT_MAP = 14, SLOT_UNMAP
 // Vertex-shader constant buffer slots of a native world draw.
 constexpr UINT CB_PROJECTION = 0, CB_VIEW = 1, CB_WORLD = 2, CB_MATERIAL = 3, CB_POINT_LIGHTS = 4,
                CB_LIGHT = 5;
-// Terrain draws keep their depth offset in b8. Model draws bind four extra
-// 16-byte buffers at b6-b9: ambient colour, white flash, depth offset, glow.
-constexpr UINT CB_DEPTH_OFFSET = 8, CB_MODEL_EXTRA = 6;
+// The native world shader also binds four 16-byte buffers at b6-b9: ambient
+// colour, white flash, depth offset and glow.
+constexpr UINT CB_EXTRA = 6;
 // Offset of a chunk buffer's triangle count (not described by CWSDK).
 constexpr size_t CHUNK_BUFFER_TRIANGLES = 0x44;
 constexpr size_t MAX_RECORDED_DRAWS = 4096, MAX_CLOUDS = 96, MAX_TERRAIN_MESHES = 512;
@@ -75,7 +75,7 @@ static std::atomic<int> toggleRequest{0}, captureRequest{0}, disableRequest{0};
 // Settings (see SteamShadows.ini).
 static bool cloudShadows = true, softShadows = false;
 static UINT resolution = 4096;
-static float radius = 120, strength = .48f, bias = .008f, sunWarmth = .03f, fadeStart = .4f;
+static float radius = 120, strength = 1.f, bias = .008f, sunWarmth = .03f, fadeStart = .4f;
 // GPU objects.
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *ctx = nullptr;
@@ -83,7 +83,11 @@ static ID3D11DeviceContext1 *ctx1 = nullptr;
 static ID3DDeviceContextState *state = nullptr; // Isolated pipeline state for our passes.
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
 static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
+// Direct-light receivers (used for all scene draws): the vertex shader also
+// estimates the native direct-sunlight share; terrain and models differ only
+// in their pixel shader (models add the receiver-plane filter).
 static ID3D11VertexShader *modelReceiver = nullptr;
+static ID3D11PixelShader *terrainVisibility = nullptr;
 static ID3D11Buffer *constants = nullptr;
 // Caster input layouts for native (UBYTE4) and animated (float4) terrain vertices.
 static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nullptr;
@@ -425,7 +429,7 @@ static bool lightMatrix(Params &p, const Draw &d) {
         activeStrength = cycle.strength;
     } else if (moonEnabled) {
         sun = norm({moon.direction[0], moon.direction[1], moon.direction[2]});
-        activeStrength = moon.shadowStrength * moon.weight;
+        activeStrength = moon.shadowStrength * moon.weight * moonrules::horizonFade(sun.z);
     }
     if (captureRequest.load() == 2) // PreviewSteamShadows: a fixed high sun.
         sun = norm({.5f, .25f, .8f});
@@ -452,8 +456,8 @@ static bool lightMatrix(Params &p, const Draw &d) {
     p.sun[2] = sun.z;
     p.sun[3] = softShadows ? 1.f : 0.f;
     p.config[0] = 1.f / resolution;
-    // Shadows fade in over the first 15% of the light's elevation.
-    p.config[1] = activeStrength * fmaxf(0.f, fminf(1.f, sun.z / .15f));
+    // Already faded near the horizon (moonrules::horizonFade).
+    p.config[1] = activeStrength;
     p.config[2] = bias / span;
     p.config[3] = radius;
     p.sunTone[1] = fadeStart;
@@ -511,10 +515,11 @@ static void compactPointLights(Params &params) {
 // visibility: compares against the shadow maps (near cascade close to the
 //             camera, far map beyond, blended between) and outputs
 //             premultiplied sun warmth (rgb) and shadow opacity (alpha).
-// Model variants (compiled with MODEL_PLANE_FILTER and MODEL_DIRECT_LIGHT):
-//   modelReceiverVertex also estimates which share of the native model light
-//   is direct sunlight; visibility then filters against the receiver plane and
-//   writes a second blend source that dims only that share.
+// Direct-light variants (MODEL_DIRECT_LIGHT), used for every scene receiver:
+//   modelReceiverVertex also estimates which share of the native light is
+//   direct sunlight (same formula as the game's world vertex shader), and
+//   visibility writes a second blend source that dims only that share. Models
+//   additionally compile with MODEL_PLANE_FILTER (receiver-plane filtering).
 // Params: config = (texel size, strength, bias, radius), eye.w = 2/depth span,
 // sun.w = soft shadows, sunTone = (warmth, fade start), depthAdjust = (native
 // depth offset, small-entity flag, light count, light count valid),
@@ -771,21 +776,22 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, levels, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
-    // Shaders, in order: shadow caster VS, scene receiver VS and visibility PS,
-    // then the model receiver VS and visibility PS (same source compiled with
-    // the model macros).
-    const char *names[] = {"caster", "receiver", "visibility", "modelReceiverVertex", "visibility"};
+    // Shaders, in order: shadow caster VS, plain receiver VS and visibility PS
+    // (kept for the filtering tests), the direct-light receiver VS, the model
+    // visibility PS and the terrain visibility PS (same source, different macros).
+    const char *names[] = {"caster",     "receiver",   "visibility",
+                           "modelReceiverVertex", "visibility", "visibility"};
     const D3D_SHADER_MACRO modelMacros[] = {
         {"MODEL_PLANE_FILTER", "1"}, {"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
-    for (int i = 0; i < 5 && ok; ++i) {
+    const D3D_SHADER_MACRO terrainMacros[] = {{"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
+    for (int i = 0; i < 6 && ok; ++i) {
         ID3DBlob *code = nullptr, *error = nullptr;
         bool vertexShader = i < 2 || i == 3;
-        bool modelVariant = i >= 3;
+        const D3D_SHADER_MACRO *macros = i == 5 ? terrainMacros : i >= 3 ? modelMacros : nullptr;
         // The model pixel shader uses Texture2D.Gather, which needs shader model 4.1.
         const char *profile = vertexShader ? "vs_4_0" : i == 4 ? "ps_4_1" : "ps_4_0";
-        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows",
-                                modelVariant ? modelMacros : nullptr, nullptr, names[i], profile,
-                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
+        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", macros, nullptr, names[i],
+                                profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
         if (error) {
             log((char *)error->GetBufferPointer());
             drop(error);
@@ -800,7 +806,10 @@ static bool initialize(ID3D11DeviceContext *context) {
                                                  : i == 1 ? &receiver
                                                           : &caster)
                     : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                nullptr, i == 4 ? &modelVisibility : &visibility));
+                                                nullptr,
+                                                i == 5   ? &terrainVisibility
+                                                : i == 4 ? &modelVisibility
+                                                         : &visibility));
         if (ok && i == 0) {
             // Caster layouts: native terrain (UBYTE4 as UNORM) and animated terrain (float4).
             D3D11_INPUT_ELEMENT_DESC element = {
@@ -1197,39 +1206,39 @@ static void renderCasters(Params &p, unsigned cascade) {
         renderCloudCasters(p, passRadius);
 }
 
-// Receiver pass: every recorded draw again. Terrain uses the visibility shader
-// and its darkening blend; models use the model variants, which attenuate only
-// the native sunlight share and keep ambient/back/point light.
+// Receiver pass: every recorded draw again. Every receiver removes only the
+// native direct-sunlight share where it is shadowed, so at full strength a
+// shadowed surface matches a face turned away from the sun in the unmodified
+// game; ambient, back and point light are kept. Terrain and models differ only
+// in their pixel shader (models add the receiver-plane filter).
 static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
     ctx->RSSetState(receiverRaster);
     ctx->OMSetRenderTargets(1, &target, depth);
     ctx->OMSetDepthStencilState(testDepth, 0);
-    ctx->OMSetBlendState(blend, nullptr, ~0u);
+    ctx->OMSetBlendState(modelBlend, nullptr, ~0u);
     ctx->RSSetViewports(1, &viewport);
-    ctx->VSSetShader(receiver, nullptr, 0);
-    ctx->PSSetShader(visibility, nullptr, 0);
+    ctx->VSSetShader(modelReceiver, nullptr, 0);
     ID3D11ShaderResourceView *shadowViews[] = {mapView, nearView};
     ctx->PSSetShaderResources(0, 2, shadowViews);
     ID3D11SamplerState *shadowSamplers[] = {sampler, rawSampler};
     ctx->PSSetSamplers(0, 2, shadowSamplers);
-    bool modelShaderBound = false;
+    // Native model linkage is verified; close models can now use the
+    // focused map, retaining hair/armor contact shadows at finer density.
+    p.cascade[3] = cascadesEnabled ? 1.f : 0.f;
+    ID3D11PixelShader *bound = nullptr;
     for (auto &x : draws) {
-        bool useModelShader = !x.terrain;
-        if (useModelShader != modelShaderBound) {
-            ctx->VSSetShader(useModelShader ? modelReceiver : receiver, nullptr, 0);
-            ctx->PSSetShader(useModelShader ? modelVisibility : visibility, nullptr, 0);
-            ctx->OMSetBlendState(useModelShader ? modelBlend : blend, nullptr, ~0u);
+        ID3D11PixelShader *shader = x.terrain ? terrainVisibility : modelVisibility;
+        if (shader != bound) {
+            ctx->PSSetShader(shader, nullptr, 0);
+            bound = shader;
         }
-        modelShaderBound = useModelShader;
-        if (useModelShader) {
-            // Native model lighting: front/back light colours, ambient and direction.
-            memcpy(p.modelFront, x.light, 16);
-            memcpy(p.modelBack, x.light + 4, 16);
-            memcpy(p.modelAmbient, x.ambient, 16);
-            memcpy(p.modelDirection, x.light + 8, 16);
-            p.modelFront[3] = x.material[3];
-            p.modelDirection[3] = x.lightProtection;
-        }
+        // Native lighting: front/back light colours, ambient and direction.
+        memcpy(p.modelFront, x.light, 16);
+        memcpy(p.modelBack, x.light + 4, 16);
+        memcpy(p.modelAmbient, x.ambient, 16);
+        memcpy(p.modelDirection, x.light + 8, 16);
+        p.modelFront[3] = x.material[3];
+        p.modelDirection[3] = x.lightProtection;
         memcpy(p.view, x.view, 64);
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
@@ -1238,9 +1247,6 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
         // Native models use varied scales. Selecting their tolerance by scale
         // can leave parts of the same actor on the terrain self-shadow path.
         p.depthAdjust[1] = x.terrain ? 0.f : 1.f;
-        // Native model linkage is verified; close models can now use the
-        // focused map, retaining hair/armor contact shadows at finer density.
-        p.cascade[3] = cascadesEnabled ? 1.f : 0.f;
         bind(x, p);
     }
 }
@@ -1520,25 +1526,18 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         frameOriginY = double(x.terrainInfo.zone.y) * 64 - x.world[7];
         frameOriginKnown = true;
     }
-    // Depth offset (both kinds), plus the native model lighting extras.
-    float offsetValues[4]{};
-    if (x.terrain) {
-        ID3D11Buffer *offsetBuffer = nullptr;
-        c->VSGetConstantBuffers(CB_DEPTH_OFFSET, 1, &offsetBuffer);
-        readBuffer(offsetBuffer, offsetValues, 16);
-        drop(offsetBuffer);
-    } else {
-        ID3D11Buffer *extraBuffers[4]{};
-        c->VSGetConstantBuffers(CB_MODEL_EXTRA, 4, extraBuffers);
-        readBuffer(extraBuffers[0], x.ambient, 16);
-        float whiteValues[4]{}, glowValues[4]{};
-        readBuffer(extraBuffers[1], whiteValues, 16);
-        readBuffer(extraBuffers[3], glowValues, 16);
-        x.lightProtection = std::clamp(std::max(whiteValues[0], glowValues[0]), 0.f, 1.f);
-        readBuffer(extraBuffers[2], offsetValues, 16);
-        for (auto &b : extraBuffers)
-            drop(b);
-    }
+    // Native lighting extras and depth offset (b6-b9; the same shader draws
+    // terrain and models).
+    ID3D11Buffer *extraBuffers[4]{};
+    c->VSGetConstantBuffers(CB_EXTRA, 4, extraBuffers);
+    float whiteValues[4]{}, offsetValues[4]{}, glowValues[4]{};
+    readBuffer(extraBuffers[0], x.ambient, 16);
+    readBuffer(extraBuffers[1], whiteValues, 16);
+    readBuffer(extraBuffers[2], offsetValues, 16);
+    readBuffer(extraBuffers[3], glowValues, 16);
+    for (auto &b : extraBuffers)
+        drop(b);
+    x.lightProtection = std::clamp(std::max(whiteValues[0], glowValues[0]), 0.f, 1.f);
     x.depthOffset = offsetValues[0];
     D3D11_VIEWPORT vp{};
     UINT vpCount = 1;
@@ -1690,7 +1689,9 @@ static void loadSettings() {
     nearRadius = std::clamp((float)GetPrivateProfileIntW(L"Shadows", L"NearRadius", 32, ini), 8.f,
                             std::max(8.f, radius * .75f));
     radius = radius < 8 ? 8 : radius > 128 ? 128 : radius;
-    strength = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 48, ini) * .01f;
+    // 100 removes all direct sunlight in shadow: as dark as faces turned away
+    // from the sun in the unmodified game.
+    strength = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 100, ini) * .01f;
     strength = strength < 0 ? 0 : strength > 1 ? 1 : strength;
 }
 static DWORD attach() {

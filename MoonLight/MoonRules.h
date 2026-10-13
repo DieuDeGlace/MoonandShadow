@@ -64,6 +64,13 @@ namespace moonrules {
 struct ShadowCycle {
     float direction[3]{}, strength = 0;
 };
+// Shadow strength factor for a light at elevation sin(angle) `z`: 0 at the
+// horizon, full from about 14.5 degrees (z = 0.25) up, so shadows keep their
+// configured darkness for most of the day and still fade smoothly when the
+// shadow light switches between sun and moon.
+inline float horizonFade(float z) {
+    return smooth(z / .25f);
+}
 // Which light casts shadows: the sun while it is above the horizon, otherwise
 // the moon; strength fades out near the horizon.
 inline ShadowCycle shadows(float milliseconds, float dayStrength, float nightStrength) {
@@ -72,7 +79,7 @@ inline ShadowCycle shadows(float milliseconds, float dayStrength, float nightStr
     bool day = moon.direction[2] < 0;
     for (int i = 0; i < 3; i++)
         out.direction[i] = day ? -moon.direction[i] : moon.direction[i];
-    float horizon = smooth(out.direction[2] / .5f);
+    float horizon = horizonFade(out.direction[2]);
     out.strength = day ? dayStrength * horizon : nightStrength * moon.weight * horizon;
     return out;
 }

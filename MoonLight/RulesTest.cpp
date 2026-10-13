@@ -38,8 +38,11 @@ int main() {
          midnight = moonrules::shadows(0, .6f, .2f);
     assert(std::abs(midday.strength - .6f) < 1e-5 && std::abs(midnight.strength - .2f) < 1e-5);
     assert(midday.direction[2] > .99 && midnight.direction[2] > .99);
-    auto evening = moonrules::shadows(17 * 3600000.f, .6f, .2f),
+    // Full strength through late afternoon; fading only in the last hour.
+    auto afternoonLate = moonrules::shadows(17 * 3600000.f, .6f, .2f),
+         evening = moonrules::shadows(17.5f * 3600000.f, .6f, .2f),
          dusk = moonrules::shadows(18 * 3600000.f, .6f, .2f);
+    assert(std::abs(afternoonLate.strength - midday.strength) < 1e-3);
     assert(evening.strength > 0 && evening.strength < midday.strength && dusk.strength < 1e-6);
     assert(moonrules::shadows(0, .6f, 0).strength == 0);
     auto morning = moonrules::shadows(9 * 3600000.f, .6f, .2f),
@@ -48,7 +51,7 @@ int main() {
     for (int minute = 1; minute < 1440; minute++) {
         auto a = moonrules::shadows((minute - 1) * 60000.f, .6f, .2f),
              b = moonrules::shadows(minute * 60000.f, .6f, .2f);
-        assert(std::abs(a.strength - b.strength) < .01f);
+        assert(std::abs(a.strength - b.strength) < .02f); // No visible step per game minute.
     }
     puts(
         "Subtle brightness limits, unchanged daytime/alpha, normalized moon direction, smooth dawn/dusk and night-only cloud dimming: PASS");
