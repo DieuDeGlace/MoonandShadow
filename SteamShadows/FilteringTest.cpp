@@ -128,6 +128,33 @@ int main() {
     shadows::replayBindings = {};
     puts(
         "100 identical replay binds: 1 constant upload and 4 IA changes; changed inputs retained: PASS");
+    {
+        shadows::Params cull{};
+        assert(shadows::lightMatrix(cull, ground));
+        auto inside = ground, faded = ground, model = ground;
+        assert(!shadows::beyondFade(inside, cull) && shadows::intersectsMap(inside, cull));
+        // Terrain whose nearest block is past the radius has zero fade everywhere.
+        faded.world[3] = shadows::radius + 3;
+        assert(shadows::beyondFade(faded, cull));
+        faded.world[3] = shadows::radius - 1;
+        assert(!shadows::beyondFade(faded, cull));
+        // A scaled model straddling the radius is kept; one far outside is culled.
+        model.terrain = false;
+        model.world[0] = model.world[5] = model.world[10] = 1.f / 16;
+        model.world[3] = shadows::radius + 10;
+        assert(!shadows::beyondFade(model, cull));
+        model.world[3] = shadows::radius * 4;
+        assert(shadows::beyondFade(model, cull) && !shadows::intersectsMap(model, cull));
+        // Camera fade measures height too: a model far below the camera is faded
+        // only when camera fade is on.
+        model.world[3] = 0;
+        model.world[11] = -shadows::radius * 2;
+        cull.sunTone[2] = 1;
+        assert(shadows::beyondFade(model, cull));
+        cull.sunTone[2] = 0;
+        assert(!shadows::beyondFade(model, cull));
+    }
+    puts("Receivers past the fade radius and casters outside the map are skipped: PASS");
     shadows::draws.push_back(ground);
     shadows::sceneViewport = {0, 0, 512, 512, 0, 1};
     shadows::CloudCaster cloud{};
