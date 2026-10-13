@@ -76,6 +76,9 @@ static std::atomic<int> toggleRequest{0}, captureRequest{0}, disableRequest{0};
 static bool cloudShadows = true, softShadows = false;
 static UINT resolution = 4096;
 static float radius = 120, strength = 1.f, bias = .008f, sunWarmth = .03f, fadeStart = .4f;
+// Fade by distance from the camera (like Omega: zooming out shortens the
+// shadow reach) instead of by ground distance from the camera's map position.
+static bool cameraFade = true;
 // GPU objects.
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *ctx = nullptr;
@@ -461,6 +464,7 @@ static bool lightMatrix(Params &p, const Draw &d) {
     p.config[2] = bias / span;
     p.config[3] = radius;
     p.sunTone[1] = fadeStart;
+    p.sunTone[2] = cameraFade ? 1.f : 0.f;
     if (g && g->world) {
         // Warm sunlight only by day, strongest when the sun is high.
         auto moonPhase = moonrules::state(g->world->state.time);
@@ -521,7 +525,7 @@ static void compactPointLights(Params &params) {
 //   visibility writes a second blend source that dims only that share. Models
 //   additionally compile with MODEL_PLANE_FILTER (receiver-plane filtering).
 // Params: config = (texel size, strength, bias, radius), eye.w = 2/depth span,
-// sun.w = soft shadows, sunTone = (warmth, fade start), depthAdjust = (native
+// sun.w = soft shadows, sunTone = (warmth, fade start, camera fade), depthAdjust = (native
 // depth offset, small-entity flag, light count, light count valid),
 // nearLight = near-cascade light matrix, cascade = (near texel size, near
 // radius, blend start, near enabled), model* = native model lighting
@@ -714,8 +718,23 @@ ModelOutput visibility(V i) {
 #else
 float4 visibility(V i):SV_TARGET{
 #endif
+    // Shadows end at config.w (Radius): ground distance from the camera's map
+    // position, or with camera fade (sunTone.z) the full distance to the camera.
+    float3 offset=i.w-eye.xyz;
+    float distance=length(offset.xy);
+    float fade=1-smoothstep(config.w*sunTone.y,config.w,length(float3(offset.xy,offset.z*sunTone.z)));
+    // Fully faded pixels are unchanged: skip the shadow-map samples.
+    [branch]if(fade<=0){
+#ifdef MODEL_DIRECT_LIGHT
+        ModelOutput none;
+        none.color=0;
+        none.transmission=1;
+        return none;
+#else
+        return 0;
+#endif
+    }
     float facing=dot(normalize(i.n),sun.xyz);
-    float distance=length(i.w.xy-eye.xy);
     float lit;
     // Near cascade inside cascade.z, far map beyond cascade.y, blended between.
     bool useNear=cascade.w>.5;
@@ -732,7 +751,6 @@ float4 visibility(V i):SV_TARGET{
             lit=lerp(nearLit,lit,smoothstep(cascade.z,cascade.y,distance));
         }
     }
-    float fade=1-smoothstep(config.w*sunTone.y,config.w,length(i.w.xy-eye.xy));
     float opacity=(1-lit)*config.y*fade;
     float local=saturate(i.local);
     float lanternProtection=0;
@@ -1677,6 +1695,7 @@ static void loadSettings() {
         std::clamp((int)GetPrivateProfileIntW(L"Shadows", L"SunWarmthPercent", 3, ini), 0, 10) *
         .01f;
     softShadows = GetPrivateProfileIntW(L"Shadows", L"SoftShadows", 0, ini) != 0;
+    cameraFade = GetPrivateProfileIntW(L"Shadows", L"CameraFade", 1, ini) != 0;
     cloudShadows = GetPrivateProfileIntW(L"Shadows", L"CloudShadows", 1, ini) != 0;
     resolution = GetPrivateProfileIntW(L"Shadows", L"Resolution", 4096, ini);
     resolution = resolution < 512 ? 512 : resolution > 4096 ? 4096 : resolution;
