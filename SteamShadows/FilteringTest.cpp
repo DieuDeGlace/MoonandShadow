@@ -401,6 +401,7 @@ int main() {
                 acne++;
     c->Unmap(staging, 0);
     printf("Unoccluded angled plane dark pixels: %d\n", acne);
+    fflush(stdout);
     assert(acne == 0);
     shadows::drop(keptTarget);
     shadows::drop(keptDepth);

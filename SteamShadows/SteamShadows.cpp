@@ -386,6 +386,9 @@ static Vec norm(Vec a) {
     float n = sqrtf(dot(a, a));
     return n > 1e-6f ? Vec{a.x / n, a.y / n, a.z / n} : Vec{0, 0, 1};
 }
+// Cast daytime shadows from the game's own light direction (SunFromGame).
+static bool sunFromGame = true;
+static Vec lastClockSun{0, 0, 1}; // Clock-driven direction, for the diagnostic log.
 
 // MoonLight's current state, if MoonandShadow/MoonLight is loaded and the moon is up.
 static bool queryMoon(MoonState &moon) {
@@ -428,11 +431,22 @@ static bool lightMatrix(Params &p, const Draw &d) {
     // MoonLight shares this map rather than installing a second caster pass.
     MoonState moon{};
     bool moonEnabled = queryMoon(moon);
+    Vec native = sun;
     if (g && g->world && g->world->local_creature) {
         auto cycle = moonrules::shadows(g->world->state.time, strength,
                                         moonEnabled ? moon.shadowStrength : 0.f);
         sun = norm({cycle.direction[0], cycle.direction[1], cycle.direction[2]});
         activeStrength = cycle.strength;
+        lastClockSun = sun;
+        // By day the game shades faces with its own light direction. Casting
+        // from the clock-driven sun instead darkened faces the game lights
+        // (and the grazing rule judged faces against the wrong angle), so
+        // follow the native direction while it is above the horizon.
+        bool day = moonrules::state(g->world->state.time).direction[2] < 0;
+        if (sunFromGame && day && native.z > .02f) {
+            sun = native;
+            activeStrength = strength * moonrules::horizonFade(native.z);
+        }
     } else if (moonEnabled) {
         sun = norm({moon.direction[0], moon.direction[1], moon.direction[2]});
         activeStrength = moon.shadowStrength * moon.weight * moonrules::horizonFade(sun.z);
@@ -682,12 +696,20 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
 #ifdef MODEL_PLANE_FILTER
     return modelPlaneVisibility(i,lightTransform,region,map);
 #else
+    float facing=dot(normalize(i.n),sun.xyz);
+    // Terrain faces the light only grazes (vertical cliff sides near noon)
+    // project thinner than a shadow texel and self-shadow in stripes. Like
+    // models, give them one consistent directional shade; faces lit at more
+    // than ~17 degrees (ground, tops) keep normal occluder shadows.
+    float exposure=depthAdjust.y>0?1:smoothstep(.15,.30,facing);
     float3 p=mul(lightTransform,float4(i.w,1)).xyz;
     float2 uv=float2(p.x,-p.y)*.5+.5;
-    float facing=dot(normalize(i.n),sun.xyz);
     // Receiver-plane depth change across the comparison sampler footprint.
+    // Derivatives come before any early return: a 2x2 quad can span faces
+    // with different exposure (cliff edges), where they would be undefined.
     float2 ux=ddx(uv),uy=ddy(uv);
     float zx=ddx(p.z),zy=ddy(p.z);
+    [branch]if(exposure<=0)return 0;
     float det=ux.x*uy.y-ux.y*uy.x;
     float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
     float footprint=region.x*region.w*eye.w*min(slope,8);
@@ -695,11 +717,10 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
     if(any(uv<region.x)||any(uv>1-region.x)||p.z<0||p.z>1)return 0;
     // Small sprite faces need a stable normal-derived footprint. Screen
     // derivatives can mix adjacent faces across a pixel quad on these models.
-    float baseBias=region.z;
-    if(depthAdjust.y>0){
+    // Slope-scaled base bias (as models use) for faces just past the grazing band.
+    float baseBias=region.z*(1+2*(1-saturate(facing)));
+    if(depthAdjust.y>0)
         footprint=0;
-        baseBias=region.z*(1+2*(1-saturate(facing)));
-    }
     float bias=baseBias+min(footprint,region.x*region.w*eye.w*16)*(sun.w>.5?2.1:1.1);
     float lit=0;
     [branch]if(sun.w>.5){
@@ -709,10 +730,9 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
                 lit+=map.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*region.x,p.z-bias);
         lit/=9;
     }else lit=map.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
-    // A face turned away from the directional light has no direct contribution.
-    // Do not let its own depth samples produce alternating bright edge teeth.
-    lit*=depthAdjust.y>0?1:smoothstep(0,.08,facing);
-    return lit;
+    // Faces turned away or grazing have little or no direct contribution; this
+    // also keeps their own depth samples from producing bright edge teeth.
+    return lit*exposure;
 #endif
 }
 
@@ -1413,6 +1433,15 @@ static void render() {
             totalMs / frames, p.eye[0], p.eye[1], p.eye[2], p.sun[0], p.sun[1], p.sun[2],
             shot ? ", captured before/after" : "");
         log(s);
+        // How far the game's light is from the clock-driven sun (daytime).
+        Vec native = norm({draws.front().light[8], draws.front().light[9],
+                           draws.front().light[10]});
+        float cosine = std::clamp(dot(native, lastClockSun), -1.f, 1.f);
+        sprintf_s(s,
+                  "Sun: game=(%.3f %.3f %.3f) clock=(%.3f %.3f %.3f), %.1f degrees apart; casting from %s",
+                  native.x, native.y, native.z, lastClockSun.x, lastClockSun.y, lastClockSun.z,
+                  acosf(cosine) * 57.2958f, sunFromGame ? "game light by day" : "clock");
+        log(s);
     }
     clearDraws();
 }
@@ -1804,6 +1833,7 @@ static void loadSettings() {
         .01f;
     softShadows = GetPrivateProfileIntW(L"Shadows", L"SoftShadows", 0, ini) != 0;
     cameraFade = GetPrivateProfileIntW(L"Shadows", L"CameraFade", 1, ini) != 0;
+    sunFromGame = GetPrivateProfileIntW(L"Shadows", L"SunFromGame", 1, ini) != 0;
     cloudShadows = GetPrivateProfileIntW(L"Shadows", L"CloudShadows", 1, ini) != 0;
     resolution = GetPrivateProfileIntW(L"Shadows", L"Resolution", 4096, ini);
     resolution = resolution < 512 ? 512 : resolution > 4096 ? 4096 : resolution;
