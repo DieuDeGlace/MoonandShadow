@@ -1,6 +1,8 @@
 #pragma once
+// Pure day/night rules shared by MoonLight and SteamShadows (and their tests).
 #include <cmath>
 #include <algorithm>
+// Shared with other mods through QueryMoonLight(); keep the layout stable.
 struct MoonState {
     unsigned version = 1;
     float weight = 0, direction[3]{}, shadowStrength = .20f;
@@ -10,6 +12,9 @@ inline float smooth(float x) {
     x = std::clamp(x, 0.f, 1.f);
     return x * x * (3 - 2 * x);
 }
+// Moon for a game time in milliseconds (24 h cycle). The moon rises at 18:00
+// and sets at 06:00; `weight` fades in/out over the first/last two hours, and
+// `direction` is a unit vector towards the moon.
 inline MoonState state(float milliseconds, float shadowStrength = .20f) {
     MoonState s;
     s.shadowStrength = shadowStrength;
@@ -29,6 +34,8 @@ inline MoonState state(float milliseconds, float shadowStrength = .20f) {
         v /= n;
     return s;
 }
+// Night version of the native light buffer (12 floats): [0..2] front colour,
+// [4..6] back colour, [8..10] light direction (replaced by the moon's).
 inline void lighting(float out[12], const float native[12], MoonState state, float amount) {
     std::copy(native, native + 12, out);
     float w = state.weight * amount;
@@ -44,6 +51,7 @@ inline void lighting(float out[12], const float native[12], MoonState state, flo
         for (int i = 8; i < 11; i++)
             out[i] /= n;
 }
+// Darkens and cools a cloud's material colour at night.
 inline void cloud(float out[4], const float native[4], float weight, float nightScale) {
     std::copy(native, native + 4, out);
     const float tint[] = {.88f, .94f, 1.f};
@@ -56,6 +64,8 @@ namespace moonrules {
 struct ShadowCycle {
     float direction[3]{}, strength = 0;
 };
+// Which light casts shadows: the sun while it is above the horizon, otherwise
+// the moon; strength fades out near the horizon.
 inline ShadowCycle shadows(float milliseconds, float dayStrength, float nightStrength) {
     auto moon = state(milliseconds, nightStrength);
     ShadowCycle out;
