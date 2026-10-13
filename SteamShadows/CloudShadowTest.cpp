@@ -13,6 +13,7 @@ static void STDMETHODCALLTYPE directClear(ID3D11DeviceContext *c, ID3D11DepthSte
     c->ClearDepthStencilView(d, f, z, s);
 }
 int main() {
+    shadows::cascadesEnabled = false;
     ID3D11Device *d = nullptr;
     ID3D11DeviceContext *c = nullptr;
     assert(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
@@ -55,6 +56,7 @@ int main() {
     c->ClearRenderTargetView(shadows::target, white);
     c->ClearDepthStencilView(shadows::depth, D3D11_CLEAR_DEPTH, .6f, 0);
     shadows::Draw ground{};
+    ground.terrain = true;
     ground.vb = vb;
     vb->AddRef();
     ground.stride = 16;
@@ -70,6 +72,8 @@ int main() {
     ground.proj[0] = ground.proj[5] = 1.f / 50;
     ground.proj[10] = .01f;
     ground.proj[11] = .5f;
+    // Native sunlight (front colour) for the direct-light receivers to remove.
+    ground.light[0] = ground.light[1] = ground.light[2] = .8f;
     ground.light[10] = 1;
     shadows::draws.push_back(ground);
     shadows::sceneViewport = {0, 0, 128, 128, 0, 1};

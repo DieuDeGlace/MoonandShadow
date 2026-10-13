@@ -17,15 +17,19 @@ constexpr size_t GAME_POINTER_RVA = 0x551a80;
 constexpr size_t CHUNK_BUFFER_Z = 0x5c;
 
 // True when running inside the exact executable these offsets were verified for.
+// Called from every draw hook; the executable cannot change while loaded.
 inline bool supported() {
-    auto base = (unsigned char *)GetModuleHandleW(nullptr);
-    auto dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
-    auto nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
-    return nt->Signature == IMAGE_NT_SIGNATURE &&
-           nt->FileHeader.TimeDateStamp == SUPPORTED_TIMESTAMP &&
-           nt->OptionalHeader.SizeOfImage == SUPPORTED_IMAGE_SIZE;
+    static const bool result = [] {
+        auto base = (unsigned char *)GetModuleHandleW(nullptr);
+        auto dos = (IMAGE_DOS_HEADER *)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+        auto nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+        return nt->Signature == IMAGE_NT_SIGNATURE &&
+               nt->FileHeader.TimeDateStamp == SUPPORTED_TIMESTAMP &&
+               nt->OptionalHeader.SizeOfImage == SUPPORTED_IMAGE_SIZE;
+    }();
+    return result;
 }
 // The game object, or nullptr on an unsupported build.
 inline cube::Game *game() {
@@ -63,6 +67,25 @@ inline const GUID animatedGuid = {
     0x6d0d6559, 0xad22, 0x410f, {0xa7, 0xc3, 0xc3, 0x79, 0x10, 0x18, 0xbb, 0x6c}};
 inline const GUID cloudDriftGuid = {
     0x2a7e9811, 0x9041, 0x4895, {0x81, 0x56, 0x2e, 0x49, 0x17, 0xc3, 0x66, 0x09}};
+// CPU mirror of small native constant buffers, shared by MoonLight and
+// SteamShadows so one Map/Update hook stores each write once.
+inline const GUID constantCacheGuid = {
+    0x89d60734, 0xeda9, 0x4bf0, {0xb0, 0x61, 0xc9, 0x11, 0x33, 0x28, 0x21, 0x18}};
+constexpr UINT CONSTANT_CACHE_LIMIT = 512;
+// Size of `r` if it is a constant buffer of at most CONSTANT_CACHE_LIMIT bytes,
+// otherwise 0. Classifies without QueryInterface: a buffer-dimension resource
+// is the buffer.
+inline UINT cachedConstantBytes(ID3D11Resource *r) {
+    D3D11_RESOURCE_DIMENSION dimension{};
+    r->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+        return 0;
+    D3D11_BUFFER_DESC d{};
+    static_cast<ID3D11Buffer *>(r)->GetDesc(&d);
+    return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && d.ByteWidth <= CONSTANT_CACHE_LIMIT
+               ? d.ByteWidth
+               : 0;
+}
 // Payload stored under chunkTagGuid on a replacement buffer.
 struct ChunkTag {
     ID3D11Buffer *original;
