@@ -24,7 +24,7 @@ Supports the inspected Steam executable (PE timestamp 0x5d93ab0d, image size 0x5
 
 Shadows match the unmodified game's own dark side. Every shadowed surface (terrain and models) loses only the direct-sunlight part of the game's lighting, using the same formula as the native world vertex shader. With `StrengthPercent=100` (the default), a sunlit surface in shadow is exactly as dark as a block face turned away from the sun; ambient, back and lantern/point light are kept, so the darkness follows the game's own day/night lighting. Lower values remove only that share of the sunlight.
 
-Shadows keep full strength while the sun or moon is more than about 14.5° above the horizon and fade out below that, so the switch between sun and moon stays smooth.
+Shadows keep full strength while the sun or moon is more than about 17.5° above the horizon and fade out below that. Within about 4.6° of the horizon (roughly 17:42–18:18 and 05:42–06:18 game time) there are no shadows at all, so the switch between sun and moon happens while nothing is drawn, and shadows fade back in as the new light rises. MoonLight also turns the native light direction gradually towards the moon as it fades in and out, instead of jumping at 18:00 and 06:00.
 
 ## Appearance and fade
 

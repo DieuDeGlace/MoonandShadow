@@ -469,7 +469,8 @@ static bool lightMatrix(Params &p, const Draw &d) {
         // Warm sunlight only by day, strongest when the sun is high.
         auto moonPhase = moonrules::state(g->world->state.time);
         p.sunTone[0] = sunWarmth * (1 - moonPhase.weight) *
-                       std::clamp(-moonPhase.direction[2] * 2.f, 0.f, 1.f);
+                       std::clamp(-moonPhase.direction[2] * 2.f, 0.f, 1.f) *
+                       moonrules::horizonFade(-moonPhase.direction[2]);
     }
     if (cascadesEnabled) {
         float nearSnap = 2 * nearRadius / nearResolution;
