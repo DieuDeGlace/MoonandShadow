@@ -17,6 +17,7 @@ class MoonandShadow : public GenericMod {
         shadows::clearDraws();
         shadows::frameOriginKnown = false;
         shadows::finished = false;
+        shadows::presentTiming();
     }
 };
 static_assert(sizeof(GenericMod) == 0x428, "Loader API 7.3 required");

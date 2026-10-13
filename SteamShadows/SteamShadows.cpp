@@ -31,8 +31,7 @@ static void log(const char *s) {
         fclose(f);
     }
 }
-static const GUID cacheGuid = {
-    0x89d60734, 0xeda9, 0x4bf0, {0xb0, 0x61, 0xc9, 0x11, 0x33, 0x28, 0x21, 0x18}};
+static const GUID cacheGuid = nativeScene::constantCacheGuid;
 static bool internal = false, enabled = true, finished = false, failed = false;
 static std::atomic<int> toggleRequest{0}, captureRequest{0}, disableRequest{0};
 static bool cloudShadows = true, softShadows = false;
@@ -82,7 +81,17 @@ static Map oldMap;
 static Unmap oldUnmap;
 static Update oldUpdate;
 static Clear oldClear;
+// Replay and constant uploads bypass hooks installed below this one. Null
+// falls back to the old* chain (tests, standalone builds).
+static DI replayDI;
+static D replayD;
+static Map rawMap;
+static Unmap rawUnmap;
 static void **table = nullptr;
+// Sparse CPU cost of the per-draw capture hook, sampled every 60th frame.
+static bool hookTimingFrame = false;
+static unsigned hookPresents = 0, hookSamples = 0, hookDraws = 0;
+static LONGLONG hookTicks = 0;
 struct Mapped {
     void *data;
     UINT bytes;
@@ -183,7 +192,7 @@ static std::vector<TerrainMesh> terrainMeshes;
 static nativeScene::Chunks loadedChunks;
 static cube::World *terrainWorld = nullptr;
 static ULONGLONG terrainRefresh = 0;
-static UINT lastTerrainCasters = 0;
+static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0;
 static void clearTerrain() {
     for (auto &m : terrainMeshes) {
         drop(m.vb);
@@ -275,13 +284,7 @@ static void clearDraws() {
     drop(depth);
 }
 static UINT bufferBytes(ID3D11Resource *r) {
-    ID3D11Buffer *b = nullptr;
-    if (FAILED(r->QueryInterface(__uuidof(ID3D11Buffer), (void **)&b)))
-        return 0;
-    D3D11_BUFFER_DESC d{};
-    b->GetDesc(&d);
-    b->Release();
-    return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && d.ByteWidth <= 512 ? d.ByteWidth : 0;
+    return nativeScene::cachedConstantBytes(r);
 }
 // Rendering must never wait for a GPU readback. Missing constants skip one draw
 // until the existing CPU Map/Update hooks observe the next native buffer write.
@@ -652,7 +655,10 @@ static bool initialize(ID3D11DeviceContext *context) {
     D3D11_BUFFER_DESC cb{};
     cb.ByteWidth = sizeof(Params);
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cb.Usage = D3D11_USAGE_DEFAULT;
+    // Replay uploads once per draw. Discard-renaming avoids the driver copy and
+    // ordering that UpdateSubresource inserts for a buffer the GPU still reads.
+    cb.Usage = D3D11_USAGE_DYNAMIC;
+    cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (ok)
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &constants));
     D3D11_TEXTURE2D_DESC td{};
@@ -853,6 +859,18 @@ struct ReplayBindings {
 };
 static ReplayBindings replayBindings;
 
+static void uploadParams(const Params &p) {
+    D3D11_MAPPED_SUBRESOURCE m{};
+    HRESULT hr = rawMap ? rawMap(ctx, constants, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)
+                        : ctx->Map(constants, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
+    if (FAILED(hr))
+        return;
+    memcpy(m.pData, &p, sizeof(p));
+    if (rawUnmap)
+        rawUnmap(ctx, constants, 0);
+    else
+        ctx->Unmap(constants, 0);
+}
 static void bind(const Draw &x, Params &p) {
     memcpy(p.world, x.world, 64);
     auto &bindings = replayBindings;
@@ -861,7 +879,7 @@ static void bind(const Draw &x, Params &p) {
         bindings.context = ctx;
     }
     if (!internal || !bindings.haveParameters || memcmp(&bindings.parameters, &p, sizeof(p)) != 0) {
-        oldUpdate(ctx, constants, 0, nullptr, &p, 0, 0);
+        uploadParams(p);
         if (internal) {
             bindings.parameters = p;
             bindings.haveParameters = true;
@@ -911,23 +929,49 @@ static void bind(const Draw &x, Params &p) {
         }
     }
     if (x.indexed)
-        oldDI(ctx, x.count, x.start, x.base);
+        (replayDI ? replayDI : oldDI)(ctx, x.count, x.start, x.base);
     else
-        oldD(ctx, x.count, x.start);
+        (replayD ? replayD : oldD)(ctx, x.count, x.start);
     drop(animated);
 }
-// Project the packed terrain's conservative bounds into the light map.
-// Tall chunks can cast into the near region from well outside its ground radius.
-static bool terrainIntersectsMap(const Draw &draw, const Params &parameters) {
-    float center[3] = {draw.world[3] + 32, draw.world[7] + 32, draw.world[11] + 127.5f};
+// Conservative world box of a native mesh. Shaders expand normalized positions
+// by 255. Terrain chunks span 64 blocks horizontally (plus a block for motion)
+// and 0..255 vertically; models use +/-255 so signed formats stay covered.
+static void drawBounds(const Draw &draw, float center[3], float extent[3]) {
+    float horizontal = draw.terrain ? 32.f : 0.f, vertical = draw.terrain ? 127.5f : 0.f;
+    float halfHorizontal = draw.terrain ? 33.f : 255.f, halfVertical = draw.terrain ? 127.5f : 255.f;
+    for (int row = 0; row < 3; ++row) {
+        const float *m = draw.world + row * 4;
+        center[row] = (m[0] + m[1]) * horizontal + m[2] * vertical + m[3];
+        extent[row] = (std::abs(m[0]) + std::abs(m[1])) * halfHorizontal +
+                      std::abs(m[2]) * halfVertical;
+    }
+}
+// Project a caster's conservative bounds into the light map. Tall chunks can
+// cast into the near region from well outside its ground radius; casters
+// wholly outside the orthographic map cannot write any of its texels.
+static bool intersectsMap(const Draw &draw, const Params &parameters) {
+    float center[3], half[3];
+    drawBounds(draw, center, half);
     for (int row : {0, 4}) {
         const float *m = parameters.light + row;
         float projected = m[0] * center[0] + m[1] * center[1] + m[2] * center[2] + m[3];
-        float extent = std::abs(m[0]) * 33 + std::abs(m[1]) * 33 + std::abs(m[2]) * 127.5f;
+        float extent = std::abs(m[0]) * half[0] + std::abs(m[1]) * half[1] +
+                       std::abs(m[2]) * half[2];
         if (projected + extent < -1 || projected - extent > 1)
             return false;
     }
     return true;
+}
+// Receiver fade reaches zero at the shadow radius, where both blend paths
+// leave the scene color unchanged. Skipping wholly faded receivers is exact.
+static bool beyondFade(const Draw &draw, const Params &parameters) {
+    float center[3], half[3];
+    drawBounds(draw, center, half);
+    float dx = std::max(std::abs(center[0] - parameters.eye[0]) - half[0], 0.f);
+    float dy = std::max(std::abs(center[1] - parameters.eye[1]) - half[1], 0.f);
+    float limit = parameters.config[3] + 1;
+    return dx * dx + dy * dy > limit * limit;
 }
 static void render() {
     if (draws.empty())
@@ -979,6 +1023,7 @@ static void render() {
     ctx->OMSetBlendState(opaque, nullptr, ~0u);
     ctx->OMSetDepthStencilState(writeDepth, 0);
     Params receiverParameters = p;
+    lastModelCasters = 0;
     for (unsigned cascadePass = 0; cascadePass < (cascadesEnabled ? 2u : 1u); ++cascadePass) {
         UINT passResolution = cascadePass ? nearResolution : resolution;
         float passRadius = cascadePass ? nearRadius : radius;
@@ -1016,18 +1061,23 @@ static void render() {
                     x.stride = 20;
                     x.layout = floatCasterLayout;
                 }
-                if (!cascadePass || terrainIntersectsMap(x, p)) {
+                if (intersectsMap(x, p)) {
                     bind(x, p);
                     lastTerrainCasters++;
                 }
                 drop(animated);
             }
             for (auto &x : draws)
-                if (!x.terrain)
+                if (!x.terrain && intersectsMap(x, p)) {
                     bind(x, p);
+                    ++lastModelCasters;
+                }
         } else
             for (auto &x : draws)
-                bind(x, p);
+                if (intersectsMap(x, p)) {
+                    bind(x, p);
+                    ++lastModelCasters;
+                }
         // Clouds cast only: never replay them as darkened scene receivers.
         lastCloudCasters = 0;
         if (cloudShadows && frameOriginKnown) {
@@ -1066,7 +1116,11 @@ static void render() {
     ID3D11SamplerState *shadowSamplers[] = {sampler, rawSampler};
     ctx->PSSetSamplers(0, 2, shadowSamplers);
     bool modelShaderBound = false;
+    lastReceivers = 0;
     for (auto &x : draws) {
+        if (beyondFade(x, p))
+            continue;
+        ++lastReceivers;
         bool useModelShader = !x.terrain;
         if (useModelShader != modelShaderBound) {
             ctx->VSSetShader(useModelShader ? modelReceiver : receiver, nullptr, 0);
@@ -1113,9 +1167,10 @@ static void render() {
         char s[512];
         sprintf_s(
             s,
-            "Shadow frame %u: receivers=%u, loaded terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",
-            frames, lastCount, lastTerrainCasters, totalMs / frames, p.eye[0], p.eye[1], p.eye[2],
-            p.sun[0], p.sun[1], p.sun[2], shot ? ", captured before/after" : "");
+            "Shadow frame %u: captured=%u, receivers=%u, model casters (both maps)=%u, last-map terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",
+            frames, lastCount, lastReceivers, lastModelCasters, lastTerrainCasters,
+            totalMs / frames, p.eye[0], p.eye[1], p.eye[2], p.sun[0], p.sun[1], p.sun[2],
+            shot ? ", captured before/after" : "");
         log(s);
     }
     clearDraws();
@@ -1332,12 +1387,38 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     draws.push_back(x);
     return true;
 }
+static void timedRecord(ID3D11DeviceContext *c, UINT count, UINT start, INT base, bool indexed) {
+    if (!hookTimingFrame) {
+        record(c, count, start, base, indexed);
+        return;
+    }
+    LARGE_INTEGER begin{}, end{};
+    QueryPerformanceCounter(&begin);
+    record(c, count, start, base, indexed);
+    QueryPerformanceCounter(&end);
+    hookTicks += end.QuadPart - begin.QuadPart;
+    ++hookDraws;
+}
+// Called once per presented frame. Logs the capture hook's CPU share.
+static void presentTiming() {
+    if (hookTimingFrame && ++hookSamples == 60) {
+        LARGE_INTEGER freq{};
+        QueryPerformanceFrequency(&freq);
+        char s[256];
+        sprintf_s(s, "Capture hook CPU: %.3f ms/frame over %.0f native draws/frame (60 sparse frames)",
+                  1000. * hookTicks / freq.QuadPart / hookSamples, double(hookDraws) / hookSamples);
+        log(s);
+        hookSamples = hookDraws = 0;
+        hookTicks = 0;
+    }
+    hookTimingFrame = hookPresents++ % 60 == 0;
+}
 static void STDMETHODCALLTYPE drawIndexed(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
-    record(c, n, s, b, true);
+    timedRecord(c, n, s, b, true);
     oldDI(c, n, s, b);
 }
 static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
-    record(c, n, s, 0, false);
+    timedRecord(c, n, s, 0, false);
     oldD(c, n, s);
 }
 static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, UINT s,
@@ -1412,8 +1493,30 @@ static bool install(ID3D11DeviceContext *c) {
         {48, (void *)update, (void **)&oldUpdate},  {53, (void *)clear, (void **)&oldClear}};
     for (auto &h : hooks)
         *h.original = v[h.slot];
+    replayDI = oldDI;
+    replayD = oldD;
+    rawMap = oldMap;
+    rawUnmap = oldUnmap;
+    // In the combined mod MoonLight already mirrors native constants into the
+    // shared cache. A second Map/Unmap/Update layer would store every write
+    // twice. Replay also skips MoonLight's per-draw hook: replayed draws use
+    // this pass's own constants, which MoonLight never modifies.
+    bool shareConstants = false;
+#ifdef MOON_AND_SHADOW
+    if (moonlight::table == v) {
+        shareConstants = true;
+        replayDI = moonlight::oldDI;
+        replayD = moonlight::oldD;
+        rawMap = moonlight::oldMap;
+        rawUnmap = moonlight::oldUnmap;
+    }
+#endif
     int done = 0;
     for (auto &h : hooks) {
+        if (shareConstants && (h.slot == 14 || h.slot == 15 || h.slot == 48)) {
+            done++;
+            continue;
+        }
         if (!patch(v + h.slot, h.fn)) {
             while (done--) {
                 auto &undo = hooks[done];
@@ -1479,6 +1582,7 @@ class SteamShadows : public GenericMod {
         shadows::clearDraws();
         shadows::frameOriginKnown = false;
         shadows::finished = false;
+        shadows::presentTiming();
     }
 };
 static_assert(sizeof(GenericMod) == 0x428, "Steam mod loader 7.3 callback layout required");

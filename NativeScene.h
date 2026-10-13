@@ -5,14 +5,19 @@
 #include <unordered_map>
 #include <cmath>
 namespace nativeScene {
+// Called from every draw hook; the executable cannot change while loaded.
 inline bool supported() {
-    auto base = (unsigned char *)GetModuleHandleW(nullptr);
-    auto dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
-    auto nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
-    return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.TimeDateStamp == 0x5d93ab0d &&
-           nt->OptionalHeader.SizeOfImage == 0x5b7000;
+    static const bool result = [] {
+        auto base = (unsigned char *)GetModuleHandleW(nullptr);
+        auto dos = (IMAGE_DOS_HEADER *)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+        auto nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+        return nt->Signature == IMAGE_NT_SIGNATURE &&
+               nt->FileHeader.TimeDateStamp == 0x5d93ab0d &&
+               nt->OptionalHeader.SizeOfImage == 0x5b7000;
+    }();
+    return result;
 }
 inline cube::Game *game() {
     return supported() ? *(cube::Game **)((unsigned char *)GetModuleHandleW(nullptr) + 0x551a80)
@@ -44,6 +49,23 @@ inline const GUID animatedGuid = {
     0x6d0d6559, 0xad22, 0x410f, {0xa7, 0xc3, 0xc3, 0x79, 0x10, 0x18, 0xbb, 0x6c}};
 inline const GUID cloudDriftGuid = {
     0x2a7e9811, 0x9041, 0x4895, {0x81, 0x56, 0x2e, 0x49, 0x17, 0xc3, 0x66, 0x09}};
+// CPU mirror of small native constant buffers, shared by MoonLight and
+// SteamShadows so one Map/Update hook stores each write once.
+inline const GUID constantCacheGuid = {
+    0x89d60734, 0xeda9, 0x4bf0, {0xb0, 0x61, 0xc9, 0x11, 0x33, 0x28, 0x21, 0x18}};
+constexpr UINT constantCacheLimit = 512;
+// Classifies without QueryInterface: a buffer-dimension resource is the buffer.
+inline UINT cachedConstantBytes(ID3D11Resource *r) {
+    D3D11_RESOURCE_DIMENSION dimension{};
+    r->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+        return 0;
+    D3D11_BUFFER_DESC d{};
+    static_cast<ID3D11Buffer *>(r)->GetDesc(&d);
+    return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && d.ByteWidth <= constantCacheLimit
+               ? d.ByteWidth
+               : 0;
+}
 struct ChunkTag {
     ID3D11Buffer *original;
     Chunk info;

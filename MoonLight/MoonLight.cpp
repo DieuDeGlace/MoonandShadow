@@ -28,8 +28,7 @@ static bool enabled = true, internal = false, visibleMoon = true;
 static float amount = .04f, cloudScale = .55f, shadowStrength = .20f;
 static std::atomic<float> sunX{0}, sunY{0}, sunZ{0};
 static std::atomic<bool> sunKnown{false};
-static const GUID cacheGuid = {
-    0x3530b23e, 0xcdae, 0x4a69, {0xa1, 0x7e, 0x23, 0x18, 0xcb, 0x7e, 0x10, 0x06}};
+static const GUID cacheGuid = nativeScene::constantCacheGuid;
 using DI = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, INT);
 using D = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT);
 using Map = HRESULT(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP,
@@ -73,20 +72,23 @@ static MoonState current() {
     return testPhase;
 #else
     auto g = nativeScene::game();
-    auto s = enabled && g && g->world && g->world->local_creature
-                 ? moonrules::state(g->world->state.time, shadowStrength)
-                 : MoonState{};
-    return s;
+    if (!enabled || !g || !g->world || !g->world->local_creature)
+        return MoonState{};
+    // Every native draw asks; the game clock changes at most once per frame.
+    static float cachedTime = NAN;
+    static MoonState cached{};
+    float time = g->world->state.time;
+    if (!(time == cachedTime)) {
+        cached = moonrules::state(time, shadowStrength);
+        cachedTime = time;
+    }
+    return cached;
 #endif
 }
+// Also mirrors the larger buffers SteamShadows reads, so the combined mod
+// stores each native constant write once.
 static UINT bytes(ID3D11Resource *r) {
-    ID3D11Buffer *b = nullptr;
-    if (FAILED(r->QueryInterface(__uuidof(ID3D11Buffer), (void **)&b)))
-        return 0;
-    D3D11_BUFFER_DESC d{};
-    b->GetDesc(&d);
-    drop(b);
-    return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && d.ByteWidth <= 64 ? d.ByteWidth : 0;
+    return nativeScene::cachedConstantBytes(r);
 }
 static bool read(ID3D11Buffer *b, void *out, UINT n) {
     if (!b)
