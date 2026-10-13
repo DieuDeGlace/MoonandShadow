@@ -386,6 +386,9 @@ static Vec norm(Vec a) {
     float n = sqrtf(dot(a, a));
     return n > 1e-6f ? Vec{a.x / n, a.y / n, a.z / n} : Vec{0, 0, 1};
 }
+// Cast daytime shadows from the game's own light direction (SunFromGame).
+static bool sunFromGame = true;
+static Vec lastClockSun{0, 0, 1}; // Clock-driven direction, for the diagnostic log.
 
 // MoonLight's current state, if MoonandShadow/MoonLight is loaded and the moon is up.
 static bool queryMoon(MoonState &moon) {
@@ -428,11 +431,22 @@ static bool lightMatrix(Params &p, const Draw &d) {
     // MoonLight shares this map rather than installing a second caster pass.
     MoonState moon{};
     bool moonEnabled = queryMoon(moon);
+    Vec native = sun;
     if (g && g->world && g->world->local_creature) {
         auto cycle = moonrules::shadows(g->world->state.time, strength,
                                         moonEnabled ? moon.shadowStrength : 0.f);
         sun = norm({cycle.direction[0], cycle.direction[1], cycle.direction[2]});
         activeStrength = cycle.strength;
+        lastClockSun = sun;
+        // By day the game shades faces with its own light direction. Casting
+        // from the clock-driven sun instead darkened faces the game lights
+        // (and the grazing rule judged faces against the wrong angle), so
+        // follow the native direction while it is above the horizon.
+        bool day = moonrules::state(g->world->state.time).direction[2] < 0;
+        if (sunFromGame && day && native.z > .02f) {
+            sun = native;
+            activeStrength = strength * moonrules::horizonFade(native.z);
+        }
     } else if (moonEnabled) {
         sun = norm({moon.direction[0], moon.direction[1], moon.direction[2]});
         activeStrength = moon.shadowStrength * moon.weight * moonrules::horizonFade(sun.z);
@@ -1419,6 +1433,15 @@ static void render() {
             totalMs / frames, p.eye[0], p.eye[1], p.eye[2], p.sun[0], p.sun[1], p.sun[2],
             shot ? ", captured before/after" : "");
         log(s);
+        // How far the game's light is from the clock-driven sun (daytime).
+        Vec native = norm({draws.front().light[8], draws.front().light[9],
+                           draws.front().light[10]});
+        float cosine = std::clamp(dot(native, lastClockSun), -1.f, 1.f);
+        sprintf_s(s,
+                  "Sun: game=(%.3f %.3f %.3f) clock=(%.3f %.3f %.3f), %.1f degrees apart; casting from %s",
+                  native.x, native.y, native.z, lastClockSun.x, lastClockSun.y, lastClockSun.z,
+                  acosf(cosine) * 57.2958f, sunFromGame ? "game light by day" : "clock");
+        log(s);
     }
     clearDraws();
 }
@@ -1810,6 +1833,7 @@ static void loadSettings() {
         .01f;
     softShadows = GetPrivateProfileIntW(L"Shadows", L"SoftShadows", 0, ini) != 0;
     cameraFade = GetPrivateProfileIntW(L"Shadows", L"CameraFade", 1, ini) != 0;
+    sunFromGame = GetPrivateProfileIntW(L"Shadows", L"SunFromGame", 1, ini) != 0;
     cloudShadows = GetPrivateProfileIntW(L"Shadows", L"CloudShadows", 1, ini) != 0;
     resolution = GetPrivateProfileIntW(L"Shadows", L"Resolution", 4096, ini);
     resolution = resolution < 512 ? 512 : resolution > 4096 ? 4096 : resolution;
