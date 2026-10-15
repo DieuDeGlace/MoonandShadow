@@ -1302,7 +1302,46 @@ static void renderCasters(Params &p, unsigned cascade) {
 // shadowed surface matches a face turned away from the sun in the unmodified
 // game; ambient, back and point light are kept. Terrain and models differ only
 // in their pixel shader (models add the receiver-plane filter).
+// Receiver workload diagnostics: every 600th shadow frame, pipeline
+// statistics (vertex/pixel shader invocations) of the receiver pass are read
+// back without waiting and logged with that frame's terrain/model receiver
+// counts and active point lights. They show whether a costly view is vertex-
+// or pixel-bound. One query in flight; no effect on the image.
+struct ReceiverStats {
+    ID3D11Query *query = nullptr;
+    bool pending = false, failed = false;
+    unsigned frame = 0, terrain = 0, models = 0, lights = 0;
+};
+static ReceiverStats receiverStats;
+static void collectReceiverStats() {
+    auto &s = receiverStats;
+    if (!s.pending)
+        return;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
+    if (ctx->GetData(s.query, &data, sizeof(data), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return;
+    s.pending = false;
+    char line[320];
+    sprintf_s(line,
+              "Receiver work: terrain=%u models=%u draws, %u active point lights (max), "
+              "VS invocations=%llu, PS invocations=%llu, triangles=%llu",
+              s.terrain, s.models, s.lights, (unsigned long long)data.VSInvocations,
+              (unsigned long long)data.PSInvocations, (unsigned long long)data.CInvocations);
+    log(line);
+}
+
 static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
+    auto &stats = receiverStats;
+    collectReceiverStats();
+    bool measure = !stats.failed && !stats.pending && stats.frame++ % 600 == 0;
+    if (measure && !stats.query) {
+        D3D11_QUERY_DESC desc{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+        stats.failed = FAILED(device->CreateQuery(&desc, &stats.query));
+        measure = !stats.failed;
+    }
+    unsigned terrainReceivers = 0, modelReceivers = 0, maxLights = 0;
+    if (measure)
+        ctx->Begin(stats.query);
     ctx->RSSetState(receiverRaster);
     ctx->OMSetRenderTargets(1, &target, depth);
     ctx->OMSetDepthStencilState(testDepth, 0);
@@ -1338,11 +1377,20 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
         compactPointLights(p);
+        maxLights = std::max(maxLights, (unsigned)p.depthAdjust[2]);
+        ++(x.terrain ? terrainReceivers : modelReceivers);
         p.depthAdjust[0] = x.depthOffset;
         // Native models use varied scales. Selecting their tolerance by scale
         // can leave parts of the same actor on the terrain self-shadow path.
         p.depthAdjust[1] = x.terrain ? 0.f : 1.f;
         bind(x, p);
+    }
+    if (measure) {
+        ctx->End(stats.query);
+        stats.pending = true;
+        stats.terrain = terrainReceivers;
+        stats.models = modelReceivers;
+        stats.lights = maxLights;
     }
 }
 
