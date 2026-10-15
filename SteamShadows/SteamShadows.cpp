@@ -24,6 +24,7 @@
 #include <d3d11shader.h>
 #include "../GpuPassTimer.h"
 #include "InlineTerrain.h"
+#include <unordered_set>
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -98,7 +99,15 @@ static ID3D11Buffer *constants = nullptr;
 static bool inlineTerrainEnabled = true;
 static ID3D11VertexShader *inlineVS = nullptr;
 static ID3D11PixelShader *inlinePS[2] = {}; // [0] plain 0x43b500, [1] shine 0x438810
-static ID3D11Buffer *inlineConstants = nullptr, *inlineShift = nullptr;
+// Static models (same mesh and absolute transform as last frame) get the same
+// treatment with the model shadow filter; moving models keep the receiver pass
+// so their self-shadows stay current-frame.
+static ID3D11PixelShader *inlineModelPS[2] = {};
+static ID3D11Buffer *inlineConstants = nullptr, *inlineShift = nullptr,
+                    *inlineModelConstants = nullptr;
+static bool inlineModelsEnabled = true;
+static std::unordered_set<uint64_t> staticKeysPrevious, staticKeysCurrent;
+static unsigned inlineModelDraws = 0;
 static unsigned inlineDraws = 0, inlineFrames = 0;
 // Native shaders are recognised by their DXBC checksum when the game creates
 // them, and tagged with this private data (1 world VS, 2 plain PS, 3 shine PS).
@@ -281,7 +290,8 @@ static std::vector<TerrainMesh> terrainMeshes;
 static nativeScene::Chunks loadedChunks; // Native vertex buffer -> chunk.
 static cube::World *terrainWorld = nullptr;
 static ULONGLONG terrainRefresh = 0;
-static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0, lastInline = 0;
+static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0, lastInline = 0,
+            lastInlineModels = 0;
 static void clearTerrain() {
     for (auto &m : terrainMeshes) {
         drop(m.vb);
@@ -910,12 +920,14 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &constants));
     if (ok && inlineTerrainEnabled) {
         // Inline terrain is optional: any failure keeps the receiver pass for terrain.
-        bool inlineOk = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inlineConstants));
+        bool inlineOk = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inlineConstants)) &&
+                        SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inlineModelConstants));
         D3D11_BUFFER_DESC shift = cb;
         shift.ByteWidth = 16;
         inlineOk = inlineOk && SUCCEEDED(device->CreateBuffer(&shift, nullptr, &inlineShift));
         std::string source = std::string(hlsl) + inlineTerrain::hlsl;
-        for (int i = 0; i < 3 && inlineOk; ++i) {
+        for (int i = 0; i < 5 && inlineOk; ++i) {
+            bool model = i >= 3;
             const D3D_SHADER_MACRO vsMacros[] = {{"MODEL_DIRECT_LIGHT", "1"},
                                                  {"INLINE_TERRAIN", "1"},
                                                  {"INLINE_VS", "1"},
@@ -923,13 +935,16 @@ static bool initialize(ID3D11DeviceContext *context) {
             const D3D_SHADER_MACRO psMacros[] = {{"MODEL_DIRECT_LIGHT", "1"},
                                                  {"INLINE_TERRAIN", "1"},
                                                  {"INLINE_PS", "1"},
-                                                 {"INLINE_SHINE", i == 2 ? "1" : "0"},
+                                                 {"INLINE_SHINE", i == 2 || i == 4 ? "1" : "0"},
+                                                 // Models: receiver-plane filter (Gather).
+                                                 {model ? "MODEL_PLANE_FILTER" : "INLINE_UNUSED", "1"},
                                                  {nullptr, nullptr}};
             ID3DBlob *code = nullptr, *error = nullptr;
             HRESULT hr = D3DCompile(source.c_str(), source.size(), "SteamShadowsInline",
                                     i == 0 ? vsMacros : psMacros, nullptr,
                                     i == 0 ? "inlineTerrainVertex" : "inlineTerrainPixel",
-                                    i == 0 ? "vs_4_0" : "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                    i == 0 ? "vs_4_0" : model ? "ps_4_1" : "ps_4_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                                     &code, &error);
             if (error) {
                 log((char *)error->GetBufferPointer());
@@ -939,15 +954,18 @@ static bool initialize(ID3D11DeviceContext *context) {
                        SUCCEEDED(i == 0 ? device->CreateVertexShader(code->GetBufferPointer(),
                                                                      code->GetBufferSize(),
                                                                      nullptr, &inlineVS)
-                                        : device->CreatePixelShader(code->GetBufferPointer(),
-                                                                    code->GetBufferSize(),
-                                                                    nullptr, &inlinePS[i - 1]));
+                                        : device->CreatePixelShader(
+                                              code->GetBufferPointer(), code->GetBufferSize(),
+                                              nullptr, model ? &inlineModelPS[i - 3] : &inlinePS[i - 1]));
             drop(code);
         }
         if (!inlineOk) {
             drop(inlineVS);
             drop(inlinePS[0]);
             drop(inlinePS[1]);
+            drop(inlineModelPS[0]);
+            drop(inlineModelPS[1]);
+            drop(inlineModelConstants);
             drop(inlineConstants);
             drop(inlineShift);
             inlineTerrainEnabled = false;
@@ -1574,9 +1592,9 @@ static void render() {
         capture("Mods\\SteamShadows-after.bmp");
     internal = false;
     lastCount = (unsigned)draws.size();
-    lastInline = 0;
+    lastInline = lastInlineModels = 0;
     for (auto &x : draws)
-        lastInline += x.inlined;
+        (x.terrain ? lastInline : lastInlineModels) += x.inlined;
     frames++;
     QueryPerformanceCounter(&end);
     totalMs += 1000. * (end.QuadPart - begin.QuadPart) / freq.QuadPart;
@@ -1584,8 +1602,9 @@ static void render() {
         char s[512];
         sprintf_s(
             s,
-            "Shadow frame %u: captured=%u, receivers=%u, inline terrain=%u, model casters (both maps)=%u, last-map terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",
-            frames, lastCount, lastReceivers, lastInline, lastModelCasters, lastTerrainCasters,
+            "Shadow frame %u: captured=%u, receivers=%u, inline terrain=%u, inline static models=%u, model casters (both maps)=%u, last-map terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",
+            frames, lastCount, lastReceivers, lastInline, lastInlineModels, lastModelCasters,
+            lastTerrainCasters,
             totalMs / frames, p.eye[0], p.eye[1], p.eye[2], p.sun[0], p.sun[1], p.sun[2],
             shot ? ", captured before/after" : "");
         log(s);
@@ -1848,6 +1867,8 @@ static void timedRecord(ID3D11DeviceContext *c, UINT count, UINT start, INT base
 }
 // Called once per presented frame. Logs the capture hook's CPU share.
 static void presentTiming() {
+    staticKeysPrevious.swap(staticKeysCurrent);
+    staticKeysCurrent.clear();
     if (hookTimingFrame && ++hookSamples == 60) {
         LARGE_INTEGER freq{};
         QueryPerformanceFrequency(&freq);
@@ -1868,13 +1889,48 @@ static int nativeKind(ID3D11DeviceChild *shader) {
         return 0;
     return kind;
 }
+// Identity of a model draw: mesh, draw range and the transform in absolute
+// world coordinates (the floating origin is added back).
+static uint64_t staticKey(const Draw &x, double originX, double originY) {
+    uint64_t h = 1469598103934665603ull;
+    auto add = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    add(uint64_t(uintptr_t(x.vb)));
+    add(uint64_t(uintptr_t(x.ib)));
+    add(uint64_t(x.count) << 32 | x.start);
+    add(uint64_t(uint32_t(x.base)));
+    for (int i = 0; i < 16; ++i) {
+        if (i == 3 || i == 7)
+            continue;
+        uint32_t bits;
+        memcpy(&bits, &x.world[i], 4);
+        add(bits);
+    }
+    add(uint64_t(int64_t(std::llround((x.world[3] + originX) * 1024))));
+    add(uint64_t(int64_t(std::llround((x.world[7] + originY) * 1024))));
+    return h;
+}
+// Records this model draw for the next frame; true when it was drawn the same
+// way last frame (it is not moving).
+static bool staticModel(const Draw &x) {
+    double ox = frameOriginKnown ? frameOriginX : inlineFrame.originX,
+           oy = frameOriginKnown ? frameOriginY : inlineFrame.originY;
+    uint64_t key = staticKey(x, ox, oy);
+    if (staticKeysCurrent.size() < 65536)
+        staticKeysCurrent.insert(key);
+    return staticKeysPrevious.count(key) != 0;
+}
+
 // Native terrain drawn with Steam's world shaders gets its shadow in this draw,
 // from the previous frame's maps; returns false to draw it natively (and leave
 // it to the receiver pass).
 static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
-    if (!inlineTerrainEnabled || !inlineVS || !enabled || failed || internal ||
-        !inlineFrame.ready || !frameOriginKnown || draws.empty() || !draws.back().terrain ||
+    if (!inlineTerrainEnabled || !inlineVS || !enabled || failed || internal || draws.empty() ||
         draws.back().inlined)
+        return false;
+    bool model = !draws.back().terrain;
+    // Every model draw is remembered, so next frame can tell whether it moved.
+    bool still = model && staticModel(draws.back());
+    if (!inlineFrame.ready || !frameOriginKnown || (model && (!inlineModelsEnabled || !still)))
         return false;
     ID3D11VertexShader *nativeVS = nullptr;
     ID3D11PixelShader *nativePS = nullptr;
@@ -1893,6 +1949,10 @@ static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     internal = true;
     if (!inlineFrame.uploaded) {
         uploadTo(inlineConstants, &inlineFrame.params, sizeof(Params));
+        // Models: the receiver's small-entity (model) path.
+        Params models = inlineFrame.params;
+        models.depthAdjust[1] = 1;
+        uploadTo(inlineModelConstants, &models, sizeof(Params));
         // Frame N world positions -> the frame the maps were rendered in.
         float shift[4] = {(float)(frameOriginX - inlineFrame.originX),
                           (float)(frameOriginY - inlineFrame.originY), 0, 0};
@@ -1907,11 +1967,11 @@ static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     c->PSGetConstantBuffers(12, 2, savedPS);
     c->PSGetShaderResources(0, 2, savedViews);
     c->PSGetSamplers(0, 2, savedSamplers);
-    ID3D11Buffer *ours[2] = {inlineConstants, inlineShift};
+    ID3D11Buffer *ours[2] = {model ? inlineModelConstants : inlineConstants, inlineShift};
     ID3D11ShaderResourceView *maps[2] = {mapView, nearView};
     ID3D11SamplerState *samplers[2] = {sampler, rawSampler};
     c->VSSetShader(inlineVS, nullptr, 0);
-    c->PSSetShader(inlinePS[psKind == 3], nullptr, 0);
+    c->PSSetShader(model ? inlineModelPS[psKind == 3] : inlinePS[psKind == 3], nullptr, 0);
     c->VSSetConstantBuffers(12, 2, ours);
     c->PSSetConstantBuffers(12, 2, ours);
     c->PSSetShaderResources(0, 2, maps);
@@ -1937,7 +1997,7 @@ static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     drop(nativeVS);
     drop(nativePS);
     draws.back().inlined = true;
-    ++inlineDraws;
+    ++(model ? inlineModelDraws : inlineDraws);
     return true;
 }
 static void STDMETHODCALLTYPE drawIndexed(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
@@ -2084,6 +2144,7 @@ static void loadSettings() {
     radius = (float)GetPrivateProfileIntW(L"Shadows", L"Radius", 120, ini);
     cascadesEnabled = GetPrivateProfileIntW(L"Shadows", L"Cascades", 1, ini) != 0;
     inlineTerrainEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineTerrain", 1, ini) != 0;
+    inlineModelsEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineModels", 1, ini) != 0;
     nearResolution =
         std::clamp((UINT)GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048, ini), 512u,
                    4096u);
