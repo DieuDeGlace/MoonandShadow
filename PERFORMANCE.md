@@ -62,3 +62,9 @@ Validation, on the RX 6600 against the installed executable's own shaders:
 - `InlineTerrainTest`: native draw plus the real receiver pass versus the real inline draw function, with a shadow map that shades about 19,000 pixels, point lights, and a shifted floating origin. The maximum difference is 1/255, which is 8-bit rounding. Overlapping coplanar faces were left out; the receiver pass blends such faces twice, while the inline draw shades them once.
 
 The live frame cost still needs `SteamShadows.log`: "inline terrain=N" in the frame line, and "Receiver work" for the remaining receivers.
+
+### Static models (same day)
+
+Models that are not moving now get the same in-draw shadow. A model counts as not moving when its mesh, draw range and absolute transform match the previous frame: buildings, props, and NPC parts standing still. Static models use the model shadow filter (`MODEL_PLANE_FILTER`, ps_4_1) and the receiver's model parameters. Moving models keep the receiver pass, so their self-shadows stay current-frame. `InlineModels=0` keeps every model on the receiver pass.
+
+`InlineTerrainTest` now also checks a rotated and scaled static model, with both pixel-shader variants and a shifted origin. The maximum difference is 1/255. The shadow frame log reports "inline static models=N".
