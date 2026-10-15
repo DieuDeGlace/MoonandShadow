@@ -163,6 +163,9 @@ struct Draw {
     DXGI_FORMAT format{};
     D3D11_PRIMITIVE_TOPOLOGY topology{};
     bool indexed = true, terrain = false;
+    // A flat lily pad on the water: it receives shadows but casts none (its
+    // one-voxel-thick shadow would fall directly under itself, on the water).
+    bool lilyPad = false, lily = false;
     nativeScene::Chunk terrainInfo{};
     float world[16], view[16], proj[16], light[12];
     float pointLights[80]{};
@@ -1241,7 +1244,7 @@ static void renderTerrainCasters(const Draw &reference, Params &p, bool nearPass
         drop(animated);
     }
     for (auto &x : draws)
-        if (!x.terrain && intersectsMap(x, p)) {
+        if (!x.terrain && !x.lilyPad && intersectsMap(x, p)) {
             bind(x, p);
             ++lastModelCasters;
         }
@@ -1288,7 +1291,7 @@ static void renderCasters(Params &p, unsigned cascade) {
         renderTerrainCasters(*reference, p, nearPass);
     else
         for (auto &x : draws)
-            if (intersectsMap(x, p)) {
+            if (!x.lilyPad && intersectsMap(x, p)) {
                 bind(x, p);
                 ++lastModelCasters;
             }
@@ -1302,7 +1305,46 @@ static void renderCasters(Params &p, unsigned cascade) {
 // shadowed surface matches a face turned away from the sun in the unmodified
 // game; ambient, back and point light are kept. Terrain and models differ only
 // in their pixel shader (models add the receiver-plane filter).
+// Receiver workload diagnostics: every 600th shadow frame, pipeline
+// statistics (vertex/pixel shader invocations) of the receiver pass are read
+// back without waiting and logged with that frame's terrain/model receiver
+// counts and active point lights. They show whether a costly view is vertex-
+// or pixel-bound. One query in flight; no effect on the image.
+struct ReceiverStats {
+    ID3D11Query *query = nullptr;
+    bool pending = false, failed = false;
+    unsigned frame = 0, terrain = 0, models = 0, lilies = 0, lights = 0;
+};
+static ReceiverStats receiverStats;
+static void collectReceiverStats() {
+    auto &s = receiverStats;
+    if (!s.pending)
+        return;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
+    if (ctx->GetData(s.query, &data, sizeof(data), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return;
+    s.pending = false;
+    char line[320];
+    sprintf_s(line,
+              "Receiver work: terrain=%u models=%u (lilies %u) draws, %u active point lights (max), "
+              "VS invocations=%llu, PS invocations=%llu, triangles=%llu",
+              s.terrain, s.models, s.lilies, s.lights, (unsigned long long)data.VSInvocations,
+              (unsigned long long)data.PSInvocations, (unsigned long long)data.CInvocations);
+    log(line);
+}
+
 static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
+    auto &stats = receiverStats;
+    collectReceiverStats();
+    bool measure = !stats.failed && !stats.pending && stats.frame++ % 600 == 0;
+    if (measure && !stats.query) {
+        D3D11_QUERY_DESC desc{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+        stats.failed = FAILED(device->CreateQuery(&desc, &stats.query));
+        measure = !stats.failed;
+    }
+    unsigned terrainReceivers = 0, modelReceivers = 0, lilyReceivers = 0, maxLights = 0;
+    if (measure)
+        ctx->Begin(stats.query);
     ctx->RSSetState(receiverRaster);
     ctx->OMSetRenderTargets(1, &target, depth);
     ctx->OMSetDepthStencilState(testDepth, 0);
@@ -1338,11 +1380,22 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
         compactPointLights(p);
+        maxLights = std::max(maxLights, (unsigned)p.depthAdjust[2]);
+        ++(x.terrain ? terrainReceivers : modelReceivers);
+        lilyReceivers += x.lily;
         p.depthAdjust[0] = x.depthOffset;
         // Native models use varied scales. Selecting their tolerance by scale
         // can leave parts of the same actor on the terrain self-shadow path.
         p.depthAdjust[1] = x.terrain ? 0.f : 1.f;
         bind(x, p);
+    }
+    if (measure) {
+        ctx->End(stats.query);
+        stats.pending = true;
+        stats.terrain = terrainReceivers;
+        stats.models = modelReceivers;
+        stats.lilies = lilyReceivers;
+        stats.lights = maxLights;
     }
 }
 
@@ -1631,6 +1684,10 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         frameOriginX = double(x.terrainInfo.zone.x) * 64 - x.world[3];
         frameOriginY = double(x.terrainInfo.zone.y) * 64 - x.world[7];
         frameOriginKnown = true;
+    } else if (auto game = nativeScene::game()) {
+        int kind = nativeScene::lily(game->world, source);
+        x.lily = kind != 0;
+        x.lilyPad = kind == 1;
     }
     // Native lighting extras and depth offset (b6-b9; the same shader draws
     // terrain and models).
