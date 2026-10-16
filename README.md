@@ -66,3 +66,11 @@ Models use direct world-space position and inverse-transpose normals, following 
 This aims for continuous hair/face contact shadows with a visible ambient-lit face. It approximates the lighting components inside Steam's existing pipeline; live appearance and performance must still be checked against the references. See PERFORMANCE.md for the current implementation and validation details.
 
 Noon adjustment: vertical model faces receive consistent directional shade at grazing light angles, with a smooth transition back to ordinary shadow sampling as they turn toward the light. This retains native ambient/local illumination and normal shading on upward-facing surfaces. Fully shaded faces skip the shadow gather; terrain filtering and map sizes are unchanged. The 160-case GPU plane sweep checks phase stability across the transition; live reference comparison remains necessary.
+
+## Batched model casters
+
+`BatchCasters=1` (default) combines repeated model meshes into instanced depth draws in each shadow map. It uses the current frame's transforms, retaining the same geometry, culling, map resolutions, filtering, darkness and face-shadow rules. Unique meshes keep ordinary draws. Animated terrain and cloud rendering retain their existing paths. This does not add a frame of shadow latency or change the existing inline receiver behavior.
+
+This is a submission optimization, rather than a change to when Steam renders its world. The inspected Alpha implementation also renders caster maps and then replays receivers; rendering the maps first alone does not remove draws. Steam's existing inline terrain/static-model shadows already avoid some receiver replays. Batching reduces repeated model submissions in the caster maps without replacing the renderer or postponing native world draws.
+
+Thirteen checks pass, including hardware and software comparisons of ordinary versus instanced caster maps. The repeated-mesh fixture reduces 255 model submissions to 5 with bit-identical depth; this is not a claim of that reduction in every live scene. The log reports actual model objects and submissions across both maps. Set `BatchCasters=0` in `Mods/SteamShadows.ini` and restart for a comparison. Failed resource creation or transform uploads use ordinary draws. See PERFORMANCE.md for limits and validation.
