@@ -294,7 +294,9 @@ static ULONGLONG terrainRefresh = 0;
 static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0, lastInline = 0,
             lastInlineModels = 0;
 static bool batchCastersEnabled = true;
+static bool tightTerrainBounds = true;
 static unsigned lastModelCasterDraws = 0, lastBatchedCasters = 0;
+static unsigned terrainCandidates = 0, terrainSubmissions = 0;
 static void initializeCasterBatches();
 static void clearTerrain() {
     for (auto &m : terrainMeshes) {
@@ -1303,9 +1305,11 @@ static void bind(const Draw &x, Params &p) {
 // Conservative world box of a native mesh. Shaders expand normalized positions
 // by 255. Terrain chunks span 64 blocks horizontally (plus a block for motion)
 // and 0..255 vertically; models use +/-255 so signed formats stay covered.
-static void drawBounds(const Draw &draw, float center[3], float extent[3]) {
-    float horizontal = draw.terrain ? 32.f : 0.f, vertical = draw.terrain ? 127.5f : 0.f;
-    float halfHorizontal = draw.terrain ? 33.f : 255.f, halfVertical = draw.terrain ? 127.5f : 255.f;
+static void drawBounds(const Draw &draw, float center[3], float extent[3],
+                       bool cachedTerrain = false) {
+    bool terrain = draw.terrain || cachedTerrain;
+    float horizontal = terrain ? 32.f : 0.f, vertical = terrain ? 127.5f : 0.f;
+    float halfHorizontal = terrain ? 33.f : 255.f, halfVertical = terrain ? 127.5f : 255.f;
     for (int row = 0; row < 3; ++row) {
         const float *m = draw.world + row * 4;
         center[row] = (m[0] + m[1]) * horizontal + m[2] * vertical + m[3];
@@ -1316,9 +1320,9 @@ static void drawBounds(const Draw &draw, float center[3], float extent[3]) {
 // Project a caster's conservative bounds into the light map. Tall chunks can
 // cast into the near region from well outside its ground radius; casters
 // wholly outside the orthographic map cannot write any of its texels.
-static bool intersectsMap(const Draw &draw, const Params &parameters) {
+static bool intersectsMap(const Draw &draw, const Params &parameters, bool cachedTerrain = false) {
     float center[3], half[3];
-    drawBounds(draw, center, half);
+    drawBounds(draw, center, half, cachedTerrain);
     for (int row : {0, 4}) {
         const float *m = parameters.light + row;
         float projected = m[0] * center[0] + m[1] * center[1] + m[2] * center[2] + m[3];
@@ -1372,9 +1376,15 @@ static void renderTerrainCasters(const Draw &reference, Params &p, bool nearPass
             x.stride = 20;
             x.layout = floatCasterLayout;
         }
-        if (intersectsMap(x, p)) {
+        // Cached casters already select their animated mesh above and do not
+        // carry Draw::terrain's replay tag. Their geometry still belongs to a
+        // 64-block chunk: use the existing terrain bounds, including XY wind
+        // padding and the full 0..255 height. Model bounds were much too large.
+        ++terrainCandidates;
+        if (intersectsMap(x, p, tightTerrainBounds)) {
             bind(x, p);
             lastTerrainCasters++;
+            ++terrainSubmissions;
         }
         drop(animated);
     }
@@ -1596,6 +1606,7 @@ static void render() {
     Params receiverParameters = p;
     lastModelCasters = 0;
     lastModelCasterDraws = lastBatchedCasters = 0;
+    terrainCandidates = terrainSubmissions = 0;
     for (unsigned cascade = 0; cascade < (cascadesEnabled ? 2u : 1u); ++cascade) {
         if (cascade)
             memcpy(p.light, receiverParameters.nearLight, 64);
@@ -1627,6 +1638,11 @@ static void render() {
                   "Model caster submissions (both maps): %u objects -> %u draws; "
                   "%u instances batched, BatchCasters=%d",
                   lastModelCasters, lastModelCasterDraws, lastBatchedCasters, batchCastersEnabled);
+        log(line);
+        sprintf_s(line,
+                  "Cached terrain caster submissions (both maps): %u candidates -> %u draws, "
+                  "TightTerrainBounds=%d",
+                  terrainCandidates, terrainSubmissions, tightTerrainBounds);
         log(line);
     }
     QueryPerformanceCounter(&end);
@@ -1922,6 +1938,25 @@ static int nativeKind(ID3D11DeviceChild *shader) {
         return 0;
     return kind;
 }
+// Shader tags are immutable after creation. Retaining the two cached interfaces
+// prevents an old address from being mistaken for a newly allocated shader.
+struct ShaderKindCache {
+    ID3D11DeviceChild *retained = nullptr;
+    int kind = 0;
+    int read(ID3D11DeviceChild *shader) {
+        if (shader == retained)
+            return kind;
+        int found = nativeKind(shader);
+        if (found) {
+            shader->AddRef();
+            drop(retained);
+            retained = shader;
+            kind = found;
+        }
+        return found;
+    }
+};
+static ShaderKindCache nativeVertexKind, nativePixelKind;
 // Identity of a model draw: mesh, draw range and the transform in absolute
 // world coordinates (the floating origin is added back).
 static uint64_t staticKey(const Draw &x, double originX, double originY) {
@@ -1969,7 +2004,7 @@ static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     ID3D11PixelShader *nativePS = nullptr;
     c->VSGetShader(&nativeVS, nullptr, nullptr);
     c->PSGetShader(&nativePS, nullptr, nullptr);
-    int vsKind = nativeKind(nativeVS), psKind = nativeKind(nativePS);
+    int vsKind = nativeVertexKind.read(nativeVS), psKind = nativePixelKind.read(nativePS);
     // A large floating-origin jump since the maps were rendered: their area no
     // longer covers this view well; use the receiver pass for this frame.
     double shiftX = frameOriginX - inlineFrame.originX, shiftY = frameOriginY - inlineFrame.originY;
@@ -1981,32 +2016,39 @@ static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     }
     internal = true;
     if (!inlineFrame.uploaded) {
-        uploadTo(inlineConstants, &inlineFrame.params, sizeof(Params));
         // Models: the receiver's small-entity (model) path.
         Params models = inlineFrame.params;
         models.depthAdjust[1] = 1;
-        uploadTo(inlineModelConstants, &models, sizeof(Params));
         // Frame N world positions -> the frame the maps were rendered in.
         float shift[4] = {(float)(frameOriginX - inlineFrame.originX),
                           (float)(frameOriginY - inlineFrame.originY), 0, 0};
-        uploadTo(inlineShift, shift, sizeof(shift));
+        if (!uploadTo(inlineConstants, &inlineFrame.params, sizeof(Params)) ||
+            !uploadTo(inlineModelConstants, &models, sizeof(Params)) ||
+            !uploadTo(inlineShift, shift, sizeof(shift))) {
+            internal = false;
+            drop(nativeVS);
+            drop(nativePS);
+            return false; // Native draw + receiver, never partially uploaded inline data.
+        }
         inlineFrame.uploaded = true;
         ++inlineFrames;
     }
-    ID3D11Buffer *savedVS[2]{}, *savedPS[2]{};
+    ID3D11Buffer *savedVS = nullptr, *savedPS = nullptr;
     ID3D11ShaderResourceView *savedViews[2]{};
     ID3D11SamplerState *savedSamplers[2]{};
-    c->VSGetConstantBuffers(12, 2, savedVS);
-    c->PSGetConstantBuffers(12, 2, savedPS);
+    // Reflection verifies VS only uses b13 and PS only uses b12. Leave the
+    // unused companion slots untouched, including any bindings owned by mods.
+    c->VSGetConstantBuffers(13, 1, &savedVS);
+    c->PSGetConstantBuffers(12, 1, &savedPS);
     c->PSGetShaderResources(0, 2, savedViews);
     c->PSGetSamplers(0, 2, savedSamplers);
-    ID3D11Buffer *ours[2] = {model ? inlineModelConstants : inlineConstants, inlineShift};
+    ID3D11Buffer *ours = model ? inlineModelConstants : inlineConstants;
     ID3D11ShaderResourceView *maps[2] = {mapView, nearView};
     ID3D11SamplerState *samplers[2] = {sampler, rawSampler};
     c->VSSetShader(inlineVS, nullptr, 0);
     c->PSSetShader(model ? inlineModelPS[psKind == 3] : inlinePS[psKind == 3], nullptr, 0);
-    c->VSSetConstantBuffers(12, 2, ours);
-    c->PSSetConstantBuffers(12, 2, ours);
+    c->VSSetConstantBuffers(13, 1, &inlineShift);
+    c->PSSetConstantBuffers(12, 1, &ours);
     c->PSSetShaderResources(0, 2, maps);
     c->PSSetSamplers(0, 2, samplers);
     internal = false;
@@ -2014,15 +2056,13 @@ static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     internal = true;
     c->VSSetShader(nativeVS, nullptr, 0);
     c->PSSetShader(nativePS, nullptr, 0);
-    c->VSSetConstantBuffers(12, 2, savedVS);
-    c->PSSetConstantBuffers(12, 2, savedPS);
+    c->VSSetConstantBuffers(13, 1, &savedVS);
+    c->PSSetConstantBuffers(12, 1, &savedPS);
     c->PSSetShaderResources(0, 2, savedViews);
     c->PSSetSamplers(0, 2, savedSamplers);
     internal = false;
-    for (auto *p : savedVS)
-        drop(p);
-    for (auto *p : savedPS)
-        drop(p);
+    drop(savedVS);
+    drop(savedPS);
     for (auto *p : savedViews)
         drop(p);
     for (auto *p : savedSamplers)
@@ -2179,6 +2219,7 @@ static void loadSettings() {
     inlineTerrainEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineTerrain", 1, ini) != 0;
     inlineModelsEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineModels", 1, ini) != 0;
     batchCastersEnabled = GetPrivateProfileIntW(L"Shadows", L"BatchCasters", 1, ini) != 0;
+    tightTerrainBounds = GetPrivateProfileIntW(L"Shadows", L"TightTerrainBounds", 1, ini) != 0;
     nearResolution =
         std::clamp((UINT)GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048, ini), 512u,
                    4096u);
