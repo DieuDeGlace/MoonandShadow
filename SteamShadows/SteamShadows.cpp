@@ -121,6 +121,19 @@ static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nul
 static bool cascadesEnabled = true;
 static UINT nearResolution = 2048;
 static float nearRadius = 32;
+// StaggerFarMap=1 (cascades only): the near map is redrawn every shadow frame,
+// the far map every other one. A skipped frame samples the previous far map
+// through the matrix it was drawn with, moved to this frame's floating origin.
+static bool staggerFarMap = false;
+struct FarMapCache {
+    bool valid = false, reusedLast = false;
+    float light[16]{};
+    double originX = 0, originY = 0;     // Floating origin the map was drawn in.
+    double eyeX = 0, eyeY = 0, eyeZ = 0; // Absolute camera position then.
+    float sun[3]{};
+};
+static FarMapCache farCache;
+static unsigned farMapsReused = 0;
 static ID3D11Texture2D *nearTexture = nullptr;
 static ID3D11DepthStencilView *nearDepth = nullptr;
 static ID3D11ShaderResourceView *nearView = nullptr;
@@ -999,6 +1012,7 @@ static bool initialize(ID3D11DeviceContext *context) {
         }
     }
     // Shadow map: 32-bit depth, also readable as a float texture.
+    farCache.valid = false; // New map contents are undefined.
     D3D11_TEXTURE2D_DESC td{};
     td.Width = td.Height = resolution;
     td.MipLevels = td.ArraySize = 1;
@@ -1092,8 +1106,10 @@ static bool initialize(ID3D11DeviceContext *context) {
     if (ok && cascadesEnabled) {
         sprintf_s(
             status,
-            "Experimental cascades active: near=%u radius=%.0f, far=%u radius=%.0f; one receiver pass.",
-            nearResolution, nearRadius, resolution, radius);
+            "Experimental cascades active: near=%u radius=%.0f, far=%u radius=%.0f; one receiver pass; "
+            "far map %s.",
+            nearResolution, nearRadius, resolution, radius,
+            staggerFarMap ? "every other frame (StaggerFarMap=1)" : "every frame");
         log(status);
     }
     return ok;
@@ -1553,18 +1569,67 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
     }
 }
 
+// Whether this shadow frame may skip the far caster pass. Never twice in a
+// row, and only while the previous far map still fits this frame: the camera
+// moved less than an eighth of the far radius (a teleport or origin rebuild
+// redraws) and the light turned by under half a degree.
+static bool reuseFarMap(const Params &p, bool shot) {
+    if (!staggerFarMap || !cascadesEnabled || !farCache.valid || farCache.reusedLast || shot)
+        return false;
+    double ox = frameOriginKnown ? frameOriginX : 0, oy = frameOriginKnown ? frameOriginY : 0;
+    double dx = p.eye[0] + ox - farCache.eyeX, dy = p.eye[1] + oy - farCache.eyeY,
+           dz = p.eye[2] - farCache.eyeZ, limit = radius * .125;
+    if (!(dx * dx + dy * dy + dz * dz < limit * limit))
+        return false;
+    float turn = p.sun[0] * farCache.sun[0] + p.sun[1] * farCache.sun[1] +
+                 p.sun[2] * farCache.sun[2];
+    return turn > .99996f; // cos(0.5 degrees)
+}
+
+// Remembers the far map just drawn with `light` (this frame's far matrix).
+static void storeFarMap(const Params &p) {
+    double ox = frameOriginKnown ? frameOriginX : 0, oy = frameOriginKnown ? frameOriginY : 0;
+    memcpy(farCache.light, p.light, 64);
+    farCache.originX = ox;
+    farCache.originY = oy;
+    farCache.eyeX = p.eye[0] + ox;
+    farCache.eyeY = p.eye[1] + oy;
+    farCache.eyeZ = p.eye[2];
+    memcpy(farCache.sun, p.sun, 12);
+    farCache.valid = true;
+    farCache.reusedLast = false;
+}
+
+// The previous far matrix for this frame's world positions. A position w now
+// was w + (origin now - origin then) when the map was drawn, so each row's
+// translation gains its x/y coefficients times that shift. Depth row included.
+static void previousFarLight(float light[16]) {
+    double ox = frameOriginKnown ? frameOriginX : 0, oy = frameOriginKnown ? frameOriginY : 0;
+    double sx = ox - farCache.originX, sy = oy - farCache.originY;
+    memcpy(light, farCache.light, 64);
+    for (int row = 0; row < 3; ++row) {
+        const float *m = farCache.light + row * 4;
+        light[row * 4 + 3] = (float)(m[3] + m[0] * sx + m[1] * sy);
+    }
+}
+
 // Renders shadows for this frame's recorded draws (once per frame) and clears them.
 static void render() {
     if (draws.empty())
         return;
     // A camera/projection can also belong to the rotating menu preview. Only
     // native terrain establishes the world origin for the supported game.
+    // Every skipped shadow frame below also drops the far map: only consecutive
+    // shadow frames may share it.
     if (nativeScene::supported() && !frameOriginKnown) {
+        farCache.valid = false;
         clearDraws();
         return;
     }
     if (finished || !enabled || failed || !target || !depth) {
         inlineFrame.ready = false;
+        if (!finished) // A second call this frame; this frame's maps are drawn.
+            farCache.valid = false;
         if (enabled && diagnosticRejects++ < 8) {
             char s[256];
             sprintf_s(s,
@@ -1578,11 +1643,13 @@ static void render() {
     finished = true;
     Params p{};
     if (!lightMatrix(p, draws.front())) {
+        farCache.valid = false;
         clearDraws();
         return;
     }
     if (p.config[1] <= 0 && captureRequest.load() == 0) { // No visible shadow (night/horizon).
         inlineFrame.ready = false;
+        farCache.valid = false;
         clearDraws();
         return;
     }
@@ -1591,6 +1658,7 @@ static void render() {
     QueryPerformanceFrequency(&freq);
     internal = true;
     bool shot = captureRequest.exchange(0) != 0;
+    bool reuseFar = reuseFarMap(p, shot);
     if (shot)
         capture("Mods\\SteamShadows-before.bmp");
     ID3DDeviceContextState *saved = nullptr;
@@ -1611,10 +1679,19 @@ static void render() {
     lastModelCasters = 0;
     lastModelCasterDraws = lastBatchedCasters = 0;
     terrainCandidates = terrainSubmissions = 0;
-    for (unsigned cascade = 0; cascade < (cascadesEnabled ? 2u : 1u); ++cascade) {
+    for (unsigned cascade = reuseFar ? 1u : 0u; cascade < (cascadesEnabled ? 2u : 1u);
+         ++cascade) {
         if (cascade)
             memcpy(p.light, receiverParameters.nearLight, 64);
         renderCasters(p, cascade);
+    }
+    // nearLight was derived from this frame's far matrix and stays current.
+    if (reuseFar) {
+        previousFarLight(receiverParameters.light);
+        farCache.reusedLast = true;
+        ++farMapsReused;
+    } else {
+        storeFarMap(receiverParameters);
     }
     p = receiverParameters;
     gpuTimer.split(ctx);
@@ -1647,6 +1724,9 @@ static void render() {
                   "Cached terrain caster submissions (both maps): %u candidates -> %u draws, "
                   "TightTerrainBounds=%d",
                   terrainCandidates, terrainSubmissions, tightTerrainBounds);
+        log(line);
+        sprintf_s(line, "Far map reused on %u of %u shadow frames, StaggerFarMap=%d",
+                  farMapsReused, frames, staggerFarMap && cascadesEnabled);
         log(line);
     }
     QueryPerformanceCounter(&end);
@@ -2229,6 +2309,7 @@ static void loadSettings() {
     inlineModelsEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineModels", 1, ini) != 0;
     batchCastersEnabled = GetPrivateProfileIntW(L"Shadows", L"BatchCasters", 1, ini) != 0;
     tightTerrainBounds = GetPrivateProfileIntW(L"Shadows", L"TightTerrainBounds", 1, ini) != 0;
+    staggerFarMap = GetPrivateProfileIntW(L"Shadows", L"StaggerFarMap", 0, ini) != 0;
     nearResolution =
         std::clamp((UINT)GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048, ini), 512u,
                    4096u);

@@ -403,6 +403,106 @@ int main() {
     printf("Unoccluded angled plane dark pixels: %d\n", acne);
     fflush(stdout);
     assert(acne == 0);
+#ifdef TEST_CASCADES
+    {
+        // StaggerFarMap: a reused far matrix, moved to a new floating origin,
+        // must map each position exactly as the stored matrix mapped the same
+        // absolute position.
+        shadows::staggerFarMap = true;
+        shadows::frameOriginKnown = true; // Recording sets it each frame; render() clears it.
+        shadows::frameOriginX = 640;
+        shadows::frameOriginY = -1280;
+        shadows::Params before{};
+        assert(shadows::lightMatrix(before, ground));
+        shadows::storeFarMap(before);
+        assert(shadows::reuseFarMap(before, false));
+        assert(!shadows::reuseFarMap(before, true)); // A capture always redraws.
+        // The same camera after a (64, -128) origin rebuild.
+        auto shifted = ground;
+        const double sx = 64, sy = -128;
+        for (int row = 0; row < 3; ++row)
+            shifted.view[row * 4 + 3] += (float)(shifted.view[row * 4] * sx +
+                                                 shifted.view[row * 4 + 1] * sy);
+        shadows::frameOriginX += sx;
+        shadows::frameOriginY += sy;
+        shadows::Params after{};
+        assert(shadows::lightMatrix(after, shifted));
+        assert(shadows::reuseFarMap(after, false));
+        float moved[16];
+        shadows::previousFarLight(moved);
+        for (float wx : {-30.f, 0.f, 45.f})
+            for (float wz : {-5.f, 20.f}) {
+                float w[3] = {wx, wx * .5f - 10, wz}, then[3] = {w[0] + (float)sx,
+                                                                 w[1] + (float)sy, w[2]};
+                for (int row = 0; row < 3; ++row) {
+                    const float *a = moved + row * 4, *b = before.light + row * 4;
+                    float now = a[0] * w[0] + a[1] * w[1] + a[2] * w[2] + a[3];
+                    float old = b[0] * then[0] + b[1] * then[1] + b[2] * then[2] + b[3];
+                    assert(std::abs(now - old) < 1e-4f);
+                }
+            }
+        // Never twice in a row; a teleport or a light turn redraws.
+        shadows::farCache.reusedLast = true;
+        assert(!shadows::reuseFarMap(after, false));
+        shadows::farCache.reusedLast = false;
+        auto teleport = after;
+        teleport.eye[0] += shadows::radius * .2f;
+        assert(!shadows::reuseFarMap(teleport, false));
+        auto turned = after;
+        // About 0.9 degrees around the vertical axis.
+        auto turn = shadows::norm({after.sun[0] - .02f * after.sun[1],
+                                   after.sun[1] + .02f * after.sun[0], after.sun[2]});
+        turned.sun[0] = turn.x;
+        turned.sun[1] = turn.y;
+        turned.sun[2] = turn.z;
+        assert(!shadows::reuseFarMap(turned, false));
+        shadows::cascadesEnabled = false;
+        assert(!shadows::reuseFarMap(after, false));
+        shadows::cascadesEnabled = true;
+        shadows::staggerFarMap = false;
+        assert(!shadows::reuseFarMap(after, false));
+        shadows::staggerFarMap = true;
+        shadows::frameOriginX = shadows::frameOriginY = 0;
+        shadows::farCache.valid = false;
+
+        // Rendered frames: draw, reuse, draw; the static image never changes.
+        std::vector<unsigned char> reference;
+        auto renderFrame = [&](bool keep) {
+            shadows::target = keptTarget;
+            keptTarget->AddRef();
+            shadows::depth = keptDepth;
+            keptDepth->AddRef();
+            c->ClearRenderTargetView(keptTarget, white);
+            c->ClearDepthStencilView(keptDepth, D3D11_CLEAR_DEPTH, .6f, 0);
+            ground.vb->AddRef();
+            ground.layout->AddRef();
+            shadows::draws.push_back(ground);
+            shadows::finished = false;
+            shadows::render();
+            c->CopyResource(staging, color);
+            assert(SUCCEEDED(c->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)));
+            std::vector<unsigned char> image(512 * 512 * 4);
+            for (int y = 0; y < 512; y++)
+                memcpy(image.data() + y * 2048, (unsigned char *)mapped.pData + y * mapped.RowPitch,
+                       2048);
+            c->Unmap(staging, 0);
+            if (keep)
+                reference = image;
+            else
+                assert(image == reference);
+        };
+        unsigned reusedBefore = shadows::farMapsReused;
+        renderFrame(true);
+        assert(shadows::farCache.valid && !shadows::farCache.reusedLast);
+        renderFrame(false);
+        assert(shadows::farMapsReused == reusedBefore + 1 && shadows::farCache.reusedLast);
+        renderFrame(false);
+        assert(shadows::farMapsReused == reusedBefore + 1 && !shadows::farCache.reusedLast);
+        shadows::staggerFarMap = false;
+        puts("Staggered far map: origin-shifted reuse matrix, redraw rules, identical static frames: "
+             "PASS");
+    }
+#endif
     shadows::drop(keptTarget);
     shadows::drop(keptDepth);
     ID3DDeviceContextState *saved = nullptr;
