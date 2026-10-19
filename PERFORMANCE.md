@@ -103,3 +103,19 @@ The HLSL is unchanged from the preceding batching build. Lighting-loop experimen
 - **Image.** Shadows within the near radius stay current. Beyond it, moving casters (and their own self-shadows on the far map) can be one frame behind. Static terrain and buildings are unaffected apart from the half-degree light-turn limit.
 
 No new test covers this yet. Check `SteamShadows.log` for "Far map reused on N of M shadow frames" and compare the GPU "map" timing with `StaggerFarMap=0` at the same location.
+
+## Measured model caster bounds, 2026-10-19
+
+`TightModelBounds=1` replaces the +/-255 local box of a model caster with its mesh's measured box (plus 0.5 local units). At native model scales (0.084–0.157) the old box reached 21–40 blocks from the model in every direction. The near map (radius 50) therefore drew nearly every visible model within about 90 blocks, and the far map drew models well outside it. Logs showed map GPU time rising from about 0.36 ms to 0.69 ms as model caster objects went from under 200 to about 1,100.
+
+- **Measurement.** Each new mesh (vertex/index buffer, input layout and draw range) is drawn once as points into a 6x1 depth row. The depth test keeps the minimum of each axis and of each negated axis. This needs no float blending, which DXVK on Vulkan does not guarantee. Up to 64 meshes are measured per shadow frame. The result is copied to one of three staging textures and read back frames later without waiting. Until then the old box is used.
+- **Invalidation.** Measured buffers carry an identity stamp (private data), so a new buffer at a reused address is never confused with the old one. Map, UpdateSubresource, CopyResource and CopySubresourceRegion on a stamped buffer replace its stamp. In the combined build, MoonLight's Map/Update hooks report these writes. Buffers written three or more times, GPU-writable (UAV/stream-output) buffers, WorldMotion's animated chunk copies and positions outside +/-4 keep the old box. `UpdateSubresource1`/`CopySubresourceRegion1` (D3D11.1) are not hooked; Steam Cube World does not call them as far as is known.
+- **Scope.** Only caster culling changes, on both maps, for opaque and see-through models. Receivers (`beyondFade`), terrain, clouds, shaders and batching keys are unchanged.
+
+`ModelBoundsTest` and its WARP counterpart compare every D32 bit of both maps against the +/-255 boxes: 900 native-scale models; UNORM byte, SNORM16 and float layouts; index and vertex ranges that skip far-away vertices; four suns; batched and unbatched. They also check the measured boxes against the vertex data. Each write path (UpdateSubresource, CopyResource, CopySubresourceRegion, Map) must make the box fall back until it is measured again. A stale box after an unobserved write is shown to change the depth map, so the test can catch a missed write. In the fixture, submissions over 16 maps drop from 6,488 to 4,494. That count is not a prediction for the game.
+
+**What to compare in `Mods/SteamShadows.log`.** Stand at the same spot and time of day. Restart once with `TightModelBounds=1` and once with `TightModelBounds=0`, and wait at least 600 shadow frames each time.
+- `Model caster culling: far map A of B candidates, near map C of D`. The candidates (B, D) are the same in both runs; the accepted counts (A, C) should drop with 1, most on the near map.
+- `Model caster submissions (both maps): N objects -> M draws`. N should drop by about the same amount.
+- `measured boxes for X of Y model draws`. X should approach Y within a few seconds. The `Mesh bounds` line shows measured, invalidated and skipped counts. A large invalidated count means the game rewrites meshes and the old box is being kept.
+- The GPU `Shadows (map/application)` timing: the "map" share is where any saving shows. Measurement adds a few points per new mesh to the "application" share.
